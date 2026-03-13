@@ -150,7 +150,7 @@ No changes to `llm4rec.py`, `train_model.py`, `main.py`, or `eval.py`.
 
 ---
 
-## How to Retrain After This Fix
+## How to Retrain After Fix 1
 
 Stage 1 is unchanged — you do **not** need to retrain it. Only retrain Stage 2:
 
@@ -166,3 +166,98 @@ python main.py --inference --id_prediction \
 # Evaluate
 python eval.py --id
 ```
+
+---
+
+## Bug 2 — Exploding Dot Products / Unstable Loss
+
+### Symptom
+
+After Fix 1 was applied, training loss alternated wildly between `0.0000` and
+very large spikes (7.0, 11.5, 16.2, 20.1, 31.4, …). The pattern continued for
+hundreds of iterations with no sign of settling, indicating a training
+instability rather than normal early-epoch noise.
+
+### Root Cause
+
+The dot-product score between `last_hidden` and the candidate embeddings is:
+
+```
+score_k = last_hidden · candidate_embs[k]
+```
+
+Both `last_hidden` (the last token of the LLM) and `candidate_embs` (the
+projected item embeddings) are **unbounded in magnitude**. When their L2 norms
+grow large, the dot products can become enormous positive or negative values.
+CrossEntropyLoss exponentiation then pushes the probability mass to near 0 or
+near 1 in a hard, brittle way:
+
+- If the correct candidate happens to have the largest logit, the loss is
+  ~0.0 (model appears "perfect" even though it is unstable).
+- If the correct candidate has a small logit, the loss explodes to 20–30+.
+
+The resulting gradients also explode, making the next step worse — a classic
+gradient explosion cycle. The loss does not decrease because every large-loss
+step corrupts the projectors and restarts the cycle.
+
+### Fix Applied
+
+**L2-normalise both vectors before the dot product** (i.e. use cosine
+similarity instead of raw dot product). This bounds every score to `[-1, 1]`,
+which keeps CrossEntropyLoss well-conditioned regardless of embedding magnitude.
+
+**Files changed:**
+
+**`models/a_llmrec_model.py`**
+
+1. Added `import torch.nn.functional as F` at the top.
+2. In `pre_train_phase2_id` — scoring block changed from:
+
+```python
+cand_stack = torch.stack([c for c in candidate_embs])
+logits = torch.bmm(cand_stack, last_hidden.unsqueeze(-1)).squeeze(-1)
+```
+
+to:
+
+```python
+cand_stack = torch.stack([c for c in candidate_embs])
+h_norm = F.normalize(last_hidden, dim=-1)       # (batch, d_model)
+c_norm = F.normalize(cand_stack, dim=-1)         # (batch, candidate_num, d_model)
+logits = torch.bmm(c_norm, h_norm.unsqueeze(-1)).squeeze(-1)
+```
+
+3. Identical change applied inside `generate_id`.
+
+### Why This Works
+
+- Cosine similarity is scale-invariant. The model cannot boost a score simply
+  by increasing the norm of its projectors — it must align the direction of
+  `last_hidden` with the target candidate's direction.
+- All logits are in `[-1, 1]`, so CrossEntropyLoss gradients are always
+  reasonable in magnitude.
+- Training loss should now decrease smoothly from roughly `log(20) ≈ 3.0`
+  towards lower values as the model learns.
+
+---
+
+## How to Retrain After Fix 2
+
+Stop any running training run, then retrain Stage 2 from scratch (Stage 1
+checkpoint is unaffected):
+
+```bash
+# Retrain Stage 2 with the normalised scoring
+python main.py --pretrain_stage2 --id_prediction \
+               --rec_pre_trained_data Movies_and_TV --llm opt
+
+# Run inference
+python main.py --inference --id_prediction \
+               --rec_pre_trained_data Movies_and_TV --llm opt
+
+# Evaluate
+python eval.py --id
+```
+
+Expected: initial loss near 3.0 (random, 20 candidates), steadily decreasing
+each epoch.
