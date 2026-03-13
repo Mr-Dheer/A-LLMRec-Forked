@@ -1,3 +1,4 @@
+import os
 import random
 import pickle
 
@@ -97,6 +98,12 @@ class A_llmrec_model(nn.Module):
             )
             nn.init.xavier_normal_(self.item_emb_proj[0].weight)
             nn.init.xavier_normal_(self.item_emb_proj[3].weight)
+
+            # candidate_num matches make_candidate_text (1 positive + 19 negatives).
+            self.candidate_num = 20
+            # Scoring is done via dot-product between the LLM hidden state and each
+            # candidate's embedding — no separate linear head needed.
+            self.ce_criterion = nn.CrossEntropyLoss()
             
     def save_model(self, args, epoch1=None, epoch2=None):
         out_dir = f'./models/saved_models/'
@@ -134,6 +141,7 @@ class A_llmrec_model(nn.Module):
             item_emb_proj_dict = torch.load(out_dir + 'item_proj.pt', map_location = args.device)
             self.item_emb_proj.load_state_dict(item_emb_proj_dict)
             del item_emb_proj_dict
+
 
     def find_item_text(self, item, title_flag=True, description_flag=True):
         """
@@ -181,16 +189,22 @@ class A_llmrec_model(nn.Module):
     def forward(self, data, optimizer=None, batch_iter=None, mode='phase1'):
         """
         Dispatch to the corresponding pipeline:
-          - mode='phase1': Stage 1 alignment training
-          - mode='phase2': Stage 2 alignment with LLM
-          - mode='generate': inference / text generation
+          - mode='phase1':     Stage 1 alignment training (SBERT + autoencoder)
+          - mode='phase2':     Stage 2 text-generation training (original)
+          - mode='generate':   Inference via text generation (original)
+          - mode='phase2_id':  Stage 2 ID-prediction training (new)
+          - mode='generate_id': Inference via ID prediction (new)
         """
         if mode == 'phase1':
             self.pre_train_phase1(data, optimizer, batch_iter)
         if mode == 'phase2':
             self.pre_train_phase2(data, optimizer, batch_iter)
-        if mode =='generate':
+        if mode == 'generate':
             self.generate(data)
+        if mode == 'phase2_id':
+            self.pre_train_phase2_id(data, optimizer, batch_iter)
+        if mode == 'generate_id':
+            return self.generate_id(data)
 
     def pre_train_phase1(self,data,optimizer, batch_iter):
         """
@@ -513,3 +527,174 @@ class A_llmrec_model(nn.Module):
             f.close()
 
         return output_text
+
+    # ------------------------------------------------------------------
+    # ID-prediction Stage 2  (AlmostRec-style)
+    # ------------------------------------------------------------------
+
+    def _build_id_samples(self, u, seq, pos):
+        """
+        Shared prompt-building logic for ID-prediction training and inference.
+
+        Returns
+        -------
+        text_input     : list[str]  – one prompt per user
+        interact_embs  : list[Tensor]  – projected history embeddings
+        candidate_embs : list[Tensor]  – projected candidate embeddings
+        candidate_ids  : list[np.ndarray]  – item IDs of candidates, per user
+        target_indices : list[int]  – index of the ground-truth item in each
+                                      shuffled candidate list
+        """
+        text_input = []
+        interact_embs = []
+        candidate_embs = []
+        candidate_ids_list = []
+        target_indices = []
+
+        for i in range(len(u)):
+            target_item_id = pos[i][-1] if pos[i].ndim > 0 else pos[i]
+            target_item_title = self.find_item_text_single(
+                target_item_id, title_flag=True, description_flag=False
+            )
+
+            interact_text, interact_ids = self.make_interact_text(seq[i][seq[i] > 0], 10)
+            candidate_text, candidate_ids = self.make_candidate_text(
+                seq[i][seq[i] > 0], self.candidate_num, target_item_id, target_item_title
+            )
+
+            # Record where the positive item ended up after shuffling.
+            target_idx = int(np.where(candidate_ids == target_item_id)[0][0])
+            target_indices.append(target_idx)
+
+            input_text = ' is a user representation.'
+            if self.args.rec_pre_trained_data == 'Movies_and_TV':
+                input_text += 'This user has watched '
+            elif self.args.rec_pre_trained_data == 'Video_Games':
+                input_text += 'This user has played '
+            else:
+                input_text += 'This user has bought '
+
+            input_text += interact_text
+
+            if self.args.rec_pre_trained_data == 'Movies_and_TV':
+                input_text += ' in the previous. Recommend one next movie for this user to watch next from the following movie title set, '
+            elif self.args.rec_pre_trained_data == 'Video_Games':
+                input_text += ' in the previous. Recommend one next game for this user to play next from the following game title set, '
+            else:
+                input_text += ' in the previous. Recommend one next item for this user to buy next from the following item title set, '
+
+            input_text += candidate_text
+            input_text += '. The recommendation is '
+
+            text_input.append(input_text)
+            interact_embs.append(self.item_emb_proj(self.get_item_emb(interact_ids)))
+            candidate_embs.append(self.item_emb_proj(self.get_item_emb(candidate_ids)))
+            candidate_ids_list.append(candidate_ids)
+
+        return text_input, interact_embs, candidate_embs, candidate_ids_list, target_indices
+
+    def pre_train_phase2_id(self, data, optimizer, batch_iter):
+        """
+        Stage 2 ID-prediction training (AlmostRec-style).
+
+        Instead of training the LLM to generate the next item's title,
+        we:
+          1. Run the same enriched prompt through the frozen LLM.
+          2. Take the last token's hidden state.
+          3. Apply a small learned linear head to get one logit per candidate.
+          4. Optimise with cross-entropy: ground-truth = position of the
+             positive item in the shuffled candidate list.
+
+        Only `log_emb_proj`, `item_emb_proj`, and `id_pred_head` receive
+        gradient updates; the LLM stays completely frozen.
+        """
+        epoch, total_epoch, step, total_step = batch_iter
+
+        optimizer.zero_grad()
+        u, seq, pos, neg = data
+
+        # Get CF user representations (frozen CF-RecSys).
+        with torch.no_grad():
+            log_emb = self.recsys.model(u, seq, pos, neg, mode='log_only')
+
+        text_input, interact_embs, candidate_embs, _, target_indices = \
+            self._build_id_samples(u, seq, pos)
+
+        samples = {
+            'text_input': text_input,
+            'interact': interact_embs,
+            'candidate': candidate_embs,
+        }
+
+        # Project user representations into the LLM token space.
+        log_emb = self.log_emb_proj(log_emb)
+
+        # Run the frozen LLM and get the last token's hidden state.
+        last_hidden = self.llm.forward_id(log_emb, samples)   # (batch, d_model)
+
+        # Dot-product scoring: score_k = last_hidden · candidate_embs[k].
+        # This is item-aware — different items have different embeddings so the
+        # model can distinguish candidates regardless of their shuffled position.
+        cand_stack = torch.stack([c for c in candidate_embs])  # (batch, candidate_num, d_model)
+        logits = torch.bmm(cand_stack, last_hidden.unsqueeze(-1)).squeeze(-1)  # (batch, candidate_num)
+
+        target_tensor = torch.tensor(target_indices, dtype=torch.long, device=self.device)
+        loss = self.ce_criterion(logits, target_tensor)
+
+        loss.backward()
+        optimizer.step()
+
+        print("A-LLMRec (ID-pred) loss in epoch {}/{} iteration {}/{}: {:.4f}".format(
+            epoch, total_epoch, step, total_step, loss.item()
+        ))
+
+    def generate_id(self, data):
+        """
+        Inference using the ID prediction head.
+
+        Returns a list of (predicted_item_id, candidate_ids, target_item_id)
+        tuples and also writes results to recommendation_output_id.txt.
+
+        Metrics (Hit@1) can be computed directly from the returned values
+        without any string matching.
+        """
+        u, seq, pos, neg, rank = data
+
+        results = []
+        with torch.no_grad():
+            log_emb = self.recsys.model(u, seq, pos, neg, mode='log_only')
+
+            text_input, interact_embs, candidate_embs, candidate_ids_list, target_indices = \
+                self._build_id_samples(u, seq, pos)
+
+        log_emb = self.log_emb_proj(log_emb)
+
+        samples = {
+            'text_input': text_input,
+            'interact': interact_embs,
+            'candidate': candidate_embs,
+        }
+
+        with torch.no_grad():
+            last_hidden = self.llm.forward_id(log_emb, samples)  # (batch, d_model)
+            # Dot-product scoring against each candidate's embedding.
+            cand_stack = torch.stack([c for c in candidate_embs])  # (batch, candidate_num, d_model)
+            logits = torch.bmm(cand_stack, last_hidden.unsqueeze(-1)).squeeze(-1)  # (batch, candidate_num)
+            pred_indices = logits.argmax(dim=-1).cpu().numpy()    # (batch,)
+
+        with open('./recommendation_output_id.txt', 'a') as f:
+            for i in range(len(u)):
+                pred_idx = pred_indices[i]
+                pred_item_id = int(candidate_ids_list[i][pred_idx])
+                target_item_id = int(candidate_ids_list[i][target_indices[i]])
+                hit = int(pred_item_id == target_item_id)
+
+                f.write(f"Target: {target_item_id} | Predicted: {pred_item_id} | Hit: {hit}\n\n")
+                results.append({
+                    'predicted_id': pred_item_id,
+                    'target_id': target_item_id,
+                    'candidate_ids': candidate_ids_list[i],
+                    'hit': hit,
+                })
+
+        return results

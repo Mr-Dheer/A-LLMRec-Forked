@@ -45,6 +45,24 @@ def inference(args):
         mp.spawn(inference_, args=(world_size, args), nprocs=world_size)
     else:
         inference_(0,0,args)
+
+def train_model_phase2_id(args):
+    """Launch Stage-2 training with the ID-prediction head."""
+    print('A-LLMRec start train phase-2 (ID prediction)\n')
+    if args.multi_gpu:
+        world_size = torch.cuda.device_count()
+        mp.spawn(train_model_phase2_id_, args=(world_size, args), nprocs=world_size)
+    else:
+        train_model_phase2_id_(0, 0, args)
+
+def inference_id(args):
+    """Launch inference using the ID-prediction head."""
+    print('A-LLMRec start inference (ID prediction)\n')
+    if args.multi_gpu:
+        world_size = torch.cuda.device_count()
+        mp.spawn(inference_id_, args=(world_size, args), nprocs=world_size)
+    else:
+        inference_id_(0, 0, args)
   
 def train_model_phase1_(rank, world_size, args):
     if args.multi_gpu:
@@ -189,3 +207,125 @@ def inference_(rank, world_size, args):
         u, seq, pos, neg = data
         u, seq, pos, neg = u.numpy(), seq.numpy(), pos.numpy(), neg.numpy()
         model([u,seq,pos,neg, rank], mode='generate')
+
+
+def train_model_phase2_id_(rank, world_size, args):
+    """
+    Worker for Stage-2 ID-prediction training.
+
+    Identical setup to train_model_phase2_ but calls mode='phase2_id',
+    which uses cross-entropy over candidate item IDs rather than the LM loss.
+    """
+    if args.multi_gpu:
+        setup_ddp(rank, world_size)
+        args.device = 'cuda:' + str(rank)
+    random.seed(0)
+
+    model = A_llmrec_model(args).to(args.device)
+    phase1_epoch = 10
+    model.load_model(args, phase1_epoch=phase1_epoch)
+
+    dataset = data_partition(args.rec_pre_trained_data, path=f'./data/amazon/{args.rec_pre_trained_data}.txt')
+    [user_train, user_valid, user_test, usernum, itemnum] = dataset
+    print('user num:', usernum, 'item num:', itemnum)
+    num_batch = len(user_train) // args.batch_size2
+
+    train_data_set = SeqDataset(user_train, usernum, itemnum, args.maxlen)
+    if args.multi_gpu:
+        train_data_loader = DataLoader(
+            train_data_set, batch_size=args.batch_size2,
+            sampler=DistributedSampler(train_data_set, shuffle=True), pin_memory=True
+        )
+        model = DDP(model, device_ids=[args.device], static_graph=True)
+    else:
+        train_data_loader = DataLoader(
+            train_data_set, batch_size=args.batch_size2, pin_memory=True, shuffle=True
+        )
+
+    adam_optimizer = torch.optim.Adam(model.parameters(), lr=args.stage2_lr, betas=(0.9, 0.98))
+
+    model.train()
+    t0 = time.time()
+    for epoch in tqdm(range(1, args.num_epochs + 1)):
+        if args.multi_gpu:
+            train_data_loader.sampler.set_epoch(epoch)
+        for step, data in enumerate(train_data_loader):
+            u, seq, pos, neg = data
+            u, seq, pos, neg = u.numpy(), seq.numpy(), pos.numpy(), neg.numpy()
+            model(
+                [u, seq, pos, neg],
+                optimizer=adam_optimizer,
+                batch_iter=[epoch, args.num_epochs + 1, step, num_batch],
+                mode='phase2_id',
+            )
+            if step % max(10, num_batch // 100) == 0:
+                if rank == 0:
+                    if args.multi_gpu:
+                        model.module.save_model(args, epoch1=phase1_epoch, epoch2=epoch)
+                    else:
+                        model.save_model(args, epoch1=phase1_epoch, epoch2=epoch)
+        if rank == 0:
+            if args.multi_gpu:
+                model.module.save_model(args, epoch1=phase1_epoch, epoch2=epoch)
+            else:
+                model.save_model(args, epoch1=phase1_epoch, epoch2=epoch)
+
+    print('phase2-id train time:', time.time() - t0)
+    if args.multi_gpu:
+        destroy_process_group()
+
+
+def inference_id_(rank, world_size, args):
+    """
+    Worker for ID-prediction inference.
+
+    Loads saved checkpoints (including id_pred_head.pt), runs generate_id(),
+    and writes results to recommendation_output_id.txt.
+    Hit@1 is computed inline and printed at the end.
+    """
+    if args.multi_gpu:
+        setup_ddp(rank, world_size)
+        args.device = 'cuda:' + str(rank)
+
+    model = A_llmrec_model(args).to(args.device)
+    phase1_epoch = 10
+    phase2_epoch = 5
+    model.load_model(args, phase1_epoch=phase1_epoch, phase2_epoch=phase2_epoch)
+
+    dataset = data_partition(args.rec_pre_trained_data, path=f'./data/amazon/{args.rec_pre_trained_data}.txt')
+    [user_train, user_valid, user_test, usernum, itemnum] = dataset
+    print('user num:', usernum, 'item num:', itemnum)
+
+    model.eval()
+
+    if usernum > 10000:
+        users = random.sample(range(1, usernum + 1), 10000)
+    else:
+        users = range(1, usernum + 1)
+
+    user_list = [u for u in users if len(user_train[u]) >= 1 and len(user_test[u]) >= 1]
+
+    inference_data_set = SeqDataset_Inference(user_train, user_valid, user_test, user_list, itemnum, args.maxlen)
+    if args.multi_gpu:
+        inference_data_loader = DataLoader(
+            inference_data_set, batch_size=args.batch_size_infer,
+            sampler=DistributedSampler(inference_data_set, shuffle=True), pin_memory=True
+        )
+        model = DDP(model, device_ids=[args.device], static_graph=True)
+    else:
+        inference_data_loader = DataLoader(
+            inference_data_set, batch_size=args.batch_size_infer, pin_memory=True
+        )
+
+    total_hit = 0
+    total_count = 0
+    for _, data in enumerate(inference_data_loader):
+        u, seq, pos, neg = data
+        u, seq, pos, neg = u.numpy(), seq.numpy(), pos.numpy(), neg.numpy()
+        batch_results = model([u, seq, pos, neg, rank], mode='generate_id')
+        if batch_results:
+            total_hit += sum(r['hit'] for r in batch_results)
+            total_count += len(batch_results)
+
+    if total_count > 0:
+        print(f"ID-prediction Hit@1: {total_hit / total_count:.4f}  ({total_hit}/{total_count})")

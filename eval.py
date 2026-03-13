@@ -1,5 +1,40 @@
 import numpy as np
-    
+
+
+# ---------------------------------------------------------------------------
+# ID-prediction evaluation  (new)
+# ---------------------------------------------------------------------------
+
+def evaluate_id(results_file='./recommendation_output_id.txt'):
+    """
+    Compute Hit@1 from the ID-prediction output file.
+
+    The file written by generate_id() has lines of the form:
+        Target: <int> | Predicted: <int> | Hit: <0 or 1>
+
+    Returns (hit_at_1, total_count).
+    """
+    total = 0
+    hits = 0
+    with open(results_file, 'r') as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            if line.startswith('Target:'):
+                parts = {kv.split(':')[0].strip(): kv.split(':')[1].strip()
+                         for kv in line.split('|')}
+                hits += int(parts.get('Hit', 0))
+                total += 1
+    if total == 0:
+        return 0.0, 0
+    return hits / total, total
+
+
+# ---------------------------------------------------------------------------
+# Original text-generation evaluation (unchanged)
+# ---------------------------------------------------------------------------
+
 def get_answers_predictions(file_path):
     answers = []
     llm_predictions = []
@@ -45,11 +80,19 @@ def evaluate(answers, llm_predictions, k=1):
     return NDCG / predict_num, HT / predict_num
 
 if __name__ == "__main__":
-    inferenced_file_path = './recommendation_output.txt'
-    answers, llm_predictions = get_answers_predictions(inferenced_file_path)
-    print(len(answers), len(llm_predictions))
-    assert(len(answers) == len(llm_predictions))
-    
-    ndcg, ht = evaluate(answers, llm_predictions, k=1)
-    print(f"ndcg at 1: {ndcg}")
-    print(f"hit at 1: {ht}")
+    import sys
+
+    if '--id' in sys.argv:
+        # Evaluate ID-prediction results.
+        hit, count = evaluate_id('./recommendation_output_id.txt')
+        print(f"ID-prediction Hit@1: {hit:.4f}  ({int(hit*count)}/{count})")
+    else:
+        # Evaluate text-generation results (original behaviour).
+        inferenced_file_path = './recommendation_output.txt'
+        answers, llm_predictions = get_answers_predictions(inferenced_file_path)
+        print(len(answers), len(llm_predictions))
+        assert len(answers) == len(llm_predictions)
+
+        ndcg, ht = evaluate(answers, llm_predictions, k=1)
+        print(f"ndcg at 1: {ndcg}")
+        print(f"hit at 1: {ht}")

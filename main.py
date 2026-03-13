@@ -3,7 +3,13 @@ import sys
 import argparse
 
 from utils import *
-from train_model import *
+from train_model import (
+    train_model_phase1,
+    train_model_phase2,
+    inference,
+    train_model_phase2_id,
+    inference_id,
+)
 
 from pre_train.sasrec.data_preprocess import preprocess
 
@@ -25,10 +31,13 @@ if __name__ == "__main__":
     parser.add_argument("--pretrain_stage1", action='store_true')
     parser.add_argument("--pretrain_stage2", action='store_true')
     parser.add_argument("--inference", action='store_true')
+    # ID-prediction mode: replaces text-generation objective with item-ID CE loss.
+    parser.add_argument("--id_prediction", action='store_true',
+                        help="Use ID-prediction head instead of text-generation for Stage 2.")
     
     # hyperparameters options
     parser.add_argument('--batch_size1', default=32, type=int)
-    parser.add_argument('--batch_size2', default=2, type=int)
+    parser.add_argument('--batch_size2', default=1, type=int)
     parser.add_argument('--batch_size_infer', default=2, type=int)
     parser.add_argument('--maxlen', default=50, type=int)
     parser.add_argument('--num_epochs', default=10, type=int)
@@ -41,7 +50,11 @@ if __name__ == "__main__":
     
     if args.pretrain_stage1:
         train_model_phase1(args)
+    elif args.pretrain_stage2 and args.id_prediction:
+        train_model_phase2_id(args)
     elif args.pretrain_stage2:
         train_model_phase2(args)
+    elif args.inference and args.id_prediction:
+        inference_id(args)
     elif args.inference:
         inference(args)

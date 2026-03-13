@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 
-from transformers import AutoTokenizer, OPTForCausalLM
+from transformers import AutoTokenizer, BitsAndBytesConfig, OPTForCausalLM
 
 
 class llm4rec(nn.Module):
@@ -25,12 +25,22 @@ class llm4rec(nn.Module):
         super().__init__()
         self.device = device
         
-        # Currently only OPT is supported as the backbone LLM.
-        if llm_model == 'opt':
-            self.llm_model = OPTForCausalLM.from_pretrained("facebook/opt-6.7b", torch_dtype=torch.float16, load_in_8bit=True, device_map=self.device)
-            self.llm_tokenizer = AutoTokenizer.from_pretrained("facebook/opt-6.7b", use_fast=False)
+        bnb_config = BitsAndBytesConfig(load_in_8bit=True)
+
+        if llm_model == "opt":
+            self.llm_model = OPTForCausalLM.from_pretrained(
+                "facebook/opt-6.7b",
+                quantization_config=bnb_config,
+                dtype=torch.float16,
+                use_safetensors=True,
+                device_map="auto",
+            )
+            self.llm_tokenizer = AutoTokenizer.from_pretrained(
+                "facebook/opt-6.7b",
+                use_fast=False,
+            )
         else:
-            raise Exception(f'{llm_model} is not supported')
+            raise Exception(f"{llm_model} is not supported")
             
         # Define pad/BOS/EOS/UNK plus special marker tokens for A-LLMRec.
         self.llm_tokenizer.add_special_tokens({'pad_token': '[PAD]'})
@@ -175,3 +185,58 @@ class llm4rec(nn.Module):
         loss = outputs.loss
 
         return loss
+
+    def forward_id(self, log_emb, samples):
+        """
+        ID-prediction forward pass (Stage 2 alternative to forward()).
+
+        Instead of computing a token-level LM loss, this method runs the same
+        enriched prompt through the frozen LLM and returns the hidden state of
+        the last token. The caller applies a small linear head to that vector
+        to produce scores over the candidate item IDs.
+
+        Args:
+          log_emb: projected user representations (batch, d_token).
+          samples: dict with 'text_input', 'interact', 'candidate'
+                   (same structure as forward(), 'text_output' not needed here).
+
+        Returns:
+          last_hidden: (batch, d_model) tensor - the last token's hidden state
+                       from the top LLM layer.
+        """
+        # Attention mask for the prepended user representation token.
+        atts_llm = torch.ones(log_emb.size()[:-1], dtype=torch.long).to(self.device)
+        atts_llm = atts_llm.unsqueeze(1)
+
+        # Tokenize the prompt text (no output text needed for ID prediction).
+        text_input_tokens = self.llm_tokenizer(
+            samples['text_input'],
+            return_tensors="pt",
+            padding="longest",
+            truncation=False,
+        ).to(self.device)
+
+        # Convert tokens to embeddings and inject history/candidate item embeddings.
+        inputs_embeds = self.llm_model.get_input_embeddings()(text_input_tokens.input_ids)
+        text_input_tokens, inputs_embeds = self.replace_hist_candi_token(
+            text_input_tokens, inputs_embeds, samples['interact'], samples['candidate']
+        )
+        attention_mask = text_input_tokens['attention_mask']
+
+        # Prepend the user representation embedding as the first token (soft prompt).
+        log_emb = log_emb.unsqueeze(1)
+        inputs_embeds = torch.cat([log_emb, inputs_embeds], dim=1)
+        attention_mask = torch.cat([atts_llm, attention_mask], dim=1)
+
+        with torch.cuda.amp.autocast():
+            outputs = self.llm_model(
+                inputs_embeds=inputs_embeds,
+                attention_mask=attention_mask,
+                return_dict=True,
+                output_hidden_states=True,
+            )
+
+        # Take the last token's hidden state from the top transformer layer.
+        # Shape: (batch, d_model)
+        last_hidden = outputs.hidden_states[-1][:, -1, :].float()
+        return last_hidden
