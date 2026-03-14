@@ -38,7 +38,7 @@ if __name__ == "__main__":
     # hyperparameters options
     parser.add_argument('--batch_size1', default=32, type=int)
     parser.add_argument('--batch_size2', default=1, type=int)
-    parser.add_argument('--batch_size_infer', default=2, type=int)
+    parser.add_argument('--batch_size_infer', default=4, type=int)
     parser.add_argument('--maxlen', default=50, type=int)
     parser.add_argument('--num_epochs', default=10, type=int)
     parser.add_argument("--stage1_lr", type=float, default=0.0001)
