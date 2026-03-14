@@ -2,6 +2,8 @@ import os
 import random
 import pickle
 
+import torch.nn.functional as F
+
 import torch
 from torch.cuda.amp import autocast as autocast
 import torch.nn as nn
@@ -502,7 +504,7 @@ class A_llmrec_model(nn.Module):
                     top_p=0.9,
                     temperature=1,
                     num_beams=1,
-                    max_length=512,
+                    max_length=2048,
                     min_length=1,
                     pad_token_id=self.llm.llm_tokenizer.eos_token_id,
                     repetition_penalty=1.5,
@@ -633,10 +635,14 @@ class A_llmrec_model(nn.Module):
         last_hidden = self.llm.forward_id(log_emb, samples)   # (batch, d_model)
 
         # Dot-product scoring: score_k = last_hidden · candidate_embs[k].
-        # This is item-aware — different items have different embeddings so the
-        # model can distinguish candidates regardless of their shuffled position.
+        # Both vectors are L2-normalised first (cosine similarity) so that
+        # scores are bounded in [-1, 1] and the loss stays stable.
+        # Without normalisation, unconstrained magnitudes cause the dot products
+        # to explode → alternating 0.0 and 30+ losses (gradient explosion).
         cand_stack = torch.stack([c for c in candidate_embs])  # (batch, candidate_num, d_model)
-        logits = torch.bmm(cand_stack, last_hidden.unsqueeze(-1)).squeeze(-1)  # (batch, candidate_num)
+        h_norm = F.normalize(last_hidden, dim=-1)               # (batch, d_model)
+        c_norm = F.normalize(cand_stack, dim=-1)                # (batch, candidate_num, d_model)
+        logits = torch.bmm(c_norm, h_norm.unsqueeze(-1)).squeeze(-1)  # (batch, candidate_num)
 
         target_tensor = torch.tensor(target_indices, dtype=torch.long, device=self.device)
         loss = self.ce_criterion(logits, target_tensor)
@@ -677,9 +683,11 @@ class A_llmrec_model(nn.Module):
 
         with torch.no_grad():
             last_hidden = self.llm.forward_id(log_emb, samples)  # (batch, d_model)
-            # Dot-product scoring against each candidate's embedding.
+            # Dot-product scoring with L2 normalisation (cosine similarity).
             cand_stack = torch.stack([c for c in candidate_embs])  # (batch, candidate_num, d_model)
-            logits = torch.bmm(cand_stack, last_hidden.unsqueeze(-1)).squeeze(-1)  # (batch, candidate_num)
+            h_norm = F.normalize(last_hidden, dim=-1)               # (batch, d_model)
+            c_norm = F.normalize(cand_stack, dim=-1)                # (batch, candidate_num, d_model)
+            logits = torch.bmm(c_norm, h_norm.unsqueeze(-1)).squeeze(-1)  # (batch, candidate_num)
             pred_indices = logits.argmax(dim=-1).cpu().numpy()    # (batch,)
 
         with open('./recommendation_output_id.txt', 'a') as f:
