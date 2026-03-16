@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 
-from transformers import AutoTokenizer, OPTForCausalLM
+from transformers import AutoTokenizer, BitsAndBytesConfig, OPTForCausalLM
 
 
 class llm4rec(nn.Module):
@@ -26,11 +26,22 @@ class llm4rec(nn.Module):
         self.device = device
         
         # Currently only OPT is supported as the backbone LLM.
-        if llm_model == 'opt':
-            self.llm_model = OPTForCausalLM.from_pretrained("facebook/opt-6.7b", torch_dtype=torch.float16, load_in_8bit=True, device_map=self.device)
-            self.llm_tokenizer = AutoTokenizer.from_pretrained("facebook/opt-6.7b", use_fast=False)
+        bnb_config = BitsAndBytesConfig(load_in_8bit=True)
+
+        if llm_model == "opt":
+            self.llm_model = OPTForCausalLM.from_pretrained(
+                "facebook/opt-6.7b",
+                quantization_config=bnb_config,
+                dtype=torch.float16,
+                use_safetensors=True,
+                device_map="auto",
+            )
+            self.llm_tokenizer = AutoTokenizer.from_pretrained(
+                "facebook/opt-6.7b",
+                use_fast=False,
+            )
         else:
-            raise Exception(f'{llm_model} is not supported')
+            raise Exception(f"{llm_model} is not supported")
             
         # Define pad/BOS/EOS/UNK plus special marker tokens for A-LLMRec.
         self.llm_tokenizer.add_special_tokens({'pad_token': '[PAD]'})

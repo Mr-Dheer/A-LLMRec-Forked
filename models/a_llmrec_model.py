@@ -488,7 +488,7 @@ class A_llmrec_model(nn.Module):
                     top_p=0.9,
                     temperature=1,
                     num_beams=1,
-                    max_length=512,
+                    max_length=2048,
                     min_length=1,
                     pad_token_id=self.llm.llm_tokenizer.eos_token_id,
                     repetition_penalty=1.5,
@@ -502,14 +502,15 @@ class A_llmrec_model(nn.Module):
 
         for i in range(len(text_input)):
             f = open(f'./recommendation_output.txt','a')
-            f.write(text_input[i])
-            f.write('\n\n')
+            # f.write(text_input[i])
+            # f.write('\n\n')
             
-            f.write('Answer: '+ answer[i])
-            f.write('\n\n')
+            f.write('Answer: ' + str(answer[i]) + '\n\n')
+            f.write('LLM: ' + str(output_text[i]) + '\n\n')
+            f.write('--------------------------------\n\n')
+
             
-            f.write('LLM: '+str(output_text[i]))
-            f.write('\n\n')
+
             f.close()
 
         return output_text
