@@ -15,7 +15,7 @@ if __name__ == "__main__":
     parser.add_argument('--gpu_num', type=int, default=0)
     
     # model setting
-    parser.add_argument("--llm", type=str, default='opt', help='flan_t5, opt, vicuna')
+    parser.add_argument("--llm", type=str, default='opt', help='flan_t5, opt, vicuna, smolvlm')
     parser.add_argument("--recsys", type=str, default='sasrec')
     
     # dataset setting
