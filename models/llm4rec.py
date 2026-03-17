@@ -82,6 +82,7 @@ class llm4rec(nn.Module):
             param.requires_grad = False
 
         self.max_output_txt_len = max_output_txt_len
+        self._llm_model_name = llm_model
 
     @property
     def llm_hidden_size(self) -> int:
@@ -97,6 +98,21 @@ class llm4rec(nn.Module):
         if hasattr(cfg, "text_config"):
             return cfg.text_config.hidden_size
         raise ValueError(f"Cannot determine hidden_size from config: {type(cfg)}")
+
+    def wrap_prompt(self, text: str) -> str:
+        """
+        Wrap a raw recommendation prompt with the model's expected input format.
+
+        SmolVLM-Instruct is trained with the Idefics3 chat template:
+            <|im_start|>User: {text}<end_of_utterance>\nAssistant:
+        Without this wrapper the instruct-tuned 2B model sees an out-of-distribution
+        prompt and generates verbose, off-topic text instead of a product title.
+
+        OPT has no chat template and receives the raw prompt unchanged.
+        """
+        if self._llm_model_name == "smolvlm":
+            return f"<|im_start|>User: {text}<end_of_utterance>\nAssistant: "
+        return text
 
     def concat_text_input_output(self, input_ids, input_atts, output_ids, output_atts):
         """

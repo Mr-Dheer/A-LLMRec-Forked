@@ -388,7 +388,7 @@ class A_llmrec_model(nn.Module):
             input_text += candidate_text
             input_text += '. The recommendation is '
 
-            text_input.append(input_text)
+            text_input.append(self.llm.wrap_prompt(input_text))
             text_output.append(target_item_title)
 
             # Project latent joint embeddings into LLM token space for all
@@ -447,9 +447,9 @@ class A_llmrec_model(nn.Module):
                 
                 input_text += candidate_text
                 input_text += '. The recommendation is '
-                
+
                 answer.append(target_item_title)
-                text_input.append(input_text)
+                text_input.append(self.llm.wrap_prompt(input_text))
                 
                 # Pre-compute projected embeddings for history and candidates.
                 interact_embs.append(self.item_emb_proj(self.get_item_emb(interact_ids)))
@@ -488,8 +488,9 @@ class A_llmrec_model(nn.Module):
                     top_p=0.9,
                     temperature=1,
                     num_beams=1,
-                    max_length=800,
+                    max_new_tokens=50,
                     min_length=1,
+                    eos_token_id=self.llm.llm_tokenizer.eos_token_id,
                     pad_token_id=self.llm.llm_tokenizer.eos_token_id,
                     repetition_penalty=1.5,
                     length_penalty=1,
