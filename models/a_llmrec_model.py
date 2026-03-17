@@ -81,19 +81,19 @@ class A_llmrec_model(nn.Module):
             self.llm = llm4rec(device=self.device, llm_model=args.llm)
             
             self.log_emb_proj = nn.Sequential(
-                nn.Linear(self.rec_sys_dim, self.llm.llm_model.config.hidden_size),
-                nn.LayerNorm(self.llm.llm_model.config.hidden_size),
+                nn.Linear(self.rec_sys_dim, self.llm.llm_hidden_size),
+                nn.LayerNorm(self.llm.llm_hidden_size),
                 nn.LeakyReLU(),
-                nn.Linear(self.llm.llm_model.config.hidden_size, self.llm.llm_model.config.hidden_size)
+                nn.Linear(self.llm.llm_hidden_size, self.llm.llm_hidden_size)
             )
             nn.init.xavier_normal_(self.log_emb_proj[0].weight)
             nn.init.xavier_normal_(self.log_emb_proj[3].weight)
 
             self.item_emb_proj = nn.Sequential(
-                nn.Linear(128, self.llm.llm_model.config.hidden_size),
-                nn.LayerNorm(self.llm.llm_model.config.hidden_size),
+                nn.Linear(128, self.llm.llm_hidden_size),
+                nn.LayerNorm(self.llm.llm_hidden_size),
                 nn.GELU(),
-                nn.Linear(self.llm.llm_model.config.hidden_size, self.llm.llm_model.config.hidden_size)
+                nn.Linear(self.llm.llm_hidden_size, self.llm.llm_hidden_size)
             )
             nn.init.xavier_normal_(self.item_emb_proj[0].weight)
             nn.init.xavier_normal_(self.item_emb_proj[3].weight)
@@ -488,7 +488,7 @@ class A_llmrec_model(nn.Module):
                     top_p=0.9,
                     temperature=1,
                     num_beams=1,
-                    max_length=2048,
+                    max_length=800,
                     min_length=1,
                     pad_token_id=self.llm.llm_tokenizer.eos_token_id,
                     repetition_penalty=1.5,
@@ -501,7 +501,7 @@ class A_llmrec_model(nn.Module):
             output_text = [text.strip() for text in output_text]
 
         for i in range(len(text_input)):
-            f = open(f'./recommendation_output.txt','a')
+            f = open(f'/home/kavach/Dev/idea-3/A-LLMRec-Forked/results/smol/recommendation_output_smol_v1_2B.txt','a')
             # f.write(text_input[i])
             # f.write('\n\n')
             
@@ -513,4 +513,4 @@ class A_llmrec_model(nn.Module):
 
             f.close()
 
-        return output_text
+        return output_text      

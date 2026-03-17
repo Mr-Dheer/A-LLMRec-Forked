@@ -1,20 +1,28 @@
 import torch
 import torch.nn as nn
 
-from transformers import AutoTokenizer, BitsAndBytesConfig, OPTForCausalLM
+from transformers import (
+    AutoModelForVision2Seq,
+    AutoProcessor,
+    AutoTokenizer,
+    BitsAndBytesConfig,
+    OPTForCausalLM,
+)
 
 
 class llm4rec(nn.Module):
     """
-    Wrapper around an OPT language model used in A-LLMRec.
+    Wrapper around a language model used in A-LLMRec.
 
     Responsibilities:
-      - Load and freeze a pretrained OPT-6.7B model and tokenizer.
+      - Load and freeze a pretrained LLM and tokenizer.
       - Register special tokens used by A-LLMRec (user rep, history, candidate).
       - Provide utilities to:
           * splice together prompt (input) and target (output) text,
           * replace special marker tokens with projected item embeddings,
           * compute the LM loss for Stage-2 training.
+
+    Supported llm_model values: "opt", "smolvlm"
     """
     def __init__(
         self,
@@ -24,11 +32,9 @@ class llm4rec(nn.Module):
     ):
         super().__init__()
         self.device = device
-        
-        # Currently only OPT is supported as the backbone LLM.
-        bnb_config = BitsAndBytesConfig(load_in_8bit=True)
 
         if llm_model == "opt":
+            bnb_config = BitsAndBytesConfig(load_in_8bit=True)
             self.llm_model = OPTForCausalLM.from_pretrained(
                 "facebook/opt-6.7b",
                 quantization_config=bnb_config,
@@ -40,24 +46,57 @@ class llm4rec(nn.Module):
                 "facebook/opt-6.7b",
                 use_fast=False,
             )
+            # OPT has no pad/bos/eos/unk by default — set them explicitly.
+            self.llm_tokenizer.add_special_tokens({'pad_token': '[PAD]'})
+            self.llm_tokenizer.add_special_tokens({'bos_token': '</s>'})
+            self.llm_tokenizer.add_special_tokens({'eos_token': '</s>'})
+            self.llm_tokenizer.add_special_tokens({'unk_token': '</s>'})
+
+        elif llm_model == "smolvlm":
+            self.llm_model = AutoModelForVision2Seq.from_pretrained(
+                "HuggingFaceTB/SmolVLM-Instruct",
+                torch_dtype=torch.bfloat16,
+                _attn_implementation="flash_attention_2" if torch.cuda.is_available() else "eager",
+                device_map="auto",
+            )
+            # SmolVLM uses Idefics3Processor; we only need the text tokenizer
+            # for A-LLMRec's prompt assembly and embedding injection.
+            # bos=<|im_start|>, eos/pad=<|im_end|>, unk=<|endoftext|> are
+            # already correctly defined — do NOT override them.
+            _processor = AutoProcessor.from_pretrained("HuggingFaceTB/SmolVLM-Instruct")
+            self.llm_tokenizer = _processor.tokenizer
+
         else:
             raise Exception(f"{llm_model} is not supported")
-            
-        # Define pad/BOS/EOS/UNK plus special marker tokens for A-LLMRec.
-        self.llm_tokenizer.add_special_tokens({'pad_token': '[PAD]'})
-        self.llm_tokenizer.add_special_tokens({'bos_token': '</s>'})
-        self.llm_tokenizer.add_special_tokens({'eos_token': '</s>'})
-        self.llm_tokenizer.add_special_tokens({'unk_token': '</s>'})
-        self.llm_tokenizer.add_special_tokens({'additional_special_tokens': ['[UserRep]','[HistoryEmb]','[CandidateEmb]']})
+
+        # Add A-LLMRec marker tokens for all models.
+        self.llm_tokenizer.add_special_tokens(
+            {'additional_special_tokens': ['[UserRep]', '[HistoryEmb]', '[CandidateEmb]']}
+        )
 
         # Resize embeddings so the model can consume the new tokens.
         self.llm_model.resize_token_embeddings(len(self.llm_tokenizer))
-        
+
         # Freeze all LLM weights; only surrounding projection heads are trainable.
         for _, param in self.llm_model.named_parameters():
             param.requires_grad = False
-            
+
         self.max_output_txt_len = max_output_txt_len
+
+    @property
+    def llm_hidden_size(self) -> int:
+        """
+        Return the text-decoder hidden size regardless of model architecture.
+
+        OPT exposes hidden_size at the top-level config.
+        SmolVLM (Idefics3) nests it under config.text_config.hidden_size.
+        """
+        cfg = self.llm_model.config
+        if hasattr(cfg, "hidden_size"):
+            return cfg.hidden_size
+        if hasattr(cfg, "text_config"):
+            return cfg.text_config.hidden_size
+        raise ValueError(f"Cannot determine hidden_size from config: {type(cfg)}")
 
     def concat_text_input_output(self, input_ids, input_atts, output_ids, output_atts):
         """
