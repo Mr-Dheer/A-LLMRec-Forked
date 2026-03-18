@@ -1,11 +1,12 @@
+import argparse
 import numpy as np
 
 
 # ---------------------------------------------------------------------------
-# ID-prediction evaluation  (new)
+# ID-prediction evaluation
 # ---------------------------------------------------------------------------
 
-def evaluate_id(results_file='./recommendation_output_id.txt'):
+def evaluate_id(results_file):
     """
     Compute Hit@1 from the ID-prediction output file.
 
@@ -32,7 +33,7 @@ def evaluate_id(results_file='./recommendation_output_id.txt'):
 
 
 # ---------------------------------------------------------------------------
-# Original text-generation evaluation (unchanged)
+# Text-generation evaluation
 # ---------------------------------------------------------------------------
 
 def get_answers_predictions(file_path):
@@ -44,22 +45,24 @@ def get_answers_predictions(file_path):
                 answer = line.replace('Answer:', '').strip()[1:-1].lower()
                 answers.append(answer)
             if 'LLM:' == line[:len('LLM:')]:
-                llm_prediction = line.replace('LLM', '').strip().lower()
-                try:
-                    llm_prediction = llm_prediction.replace("\"item title\" : ", '')
-                    start = llm_prediction.find('"')
-                    end = llm_prediction.rfind('"')
+                # Use replace('LLM:', '', 1) to avoid clobbering 'LLM' in titles.
+                llm_prediction = line.replace('LLM:', '', 1).strip().lower()
+                # Format A (SmolVLM-2B with chat template): LLM: "title"
+                # Format B (SmolVLM-500M without template): LLM: title"
+                # For format A, first and last " differ → extract between them.
+                # For format B, only a trailing " → strip it directly.
+                start = llm_prediction.find('"')
+                end = llm_prediction.rfind('"')
+                if start != -1 and end != -1 and start != end:
+                    # Format A: text between first and last quote.
+                    llm_prediction = llm_prediction[start + 1:end]
+                elif llm_prediction.endswith('"'):
+                    # Format B: just a trailing quote, strip it.
+                    llm_prediction = llm_prediction[:-1]
+                llm_predictions.append(llm_prediction.strip())
 
-                    if (start + end < start) or (start + end < end):
-                        print(1/0)
-                        
-                    llm_prediction = llm_prediction[start+1:end]
-                except Exception as e:
-                    print()
-                    
-                llm_predictions.append(llm_prediction)
-                
     return answers, llm_predictions
+
 
 def evaluate(answers, llm_predictions, k=1):
     NDCG = 0.0
@@ -76,20 +79,36 @@ def evaluate(answers, llm_predictions, k=1):
             if answer in prediction:
                 NDCG += 1
                 HT += 1
-                
+
     return NDCG / predict_num, HT / predict_num
 
-if __name__ == "__main__":
-    import sys
 
-    if '--id' in sys.argv:
-        # Evaluate ID-prediction results.
-        hit, count = evaluate_id('./recommendation_output_id.txt')
-        print(f"ID-prediction Hit@1: {hit:.4f}  ({int(hit*count)}/{count})")
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        '--file',
+        type=str,
+        default='./recommendation_output.txt',
+        help='Path to the text-generation output file',
+    )
+    parser.add_argument(
+        '--id_file',
+        type=str,
+        default='./recommendation_output_id.txt',
+        help='Path to the ID-prediction output file (used with --id)',
+    )
+    parser.add_argument(
+        '--id',
+        action='store_true',
+        help='Evaluate ID-prediction results instead of text-generation results',
+    )
+    args = parser.parse_args()
+
+    if args.id:
+        hit, count = evaluate_id(args.id_file)
+        print(f"ID-prediction Hit@1: {hit:.4f}  ({int(hit * count)}/{count})")
     else:
-        # Evaluate text-generation results (original behaviour).
-        inferenced_file_path = './recommendation_output.txt'
-        answers, llm_predictions = get_answers_predictions(inferenced_file_path)
+        answers, llm_predictions = get_answers_predictions(args.file)
         print(len(answers), len(llm_predictions))
         assert len(answers) == len(llm_predictions)
 
