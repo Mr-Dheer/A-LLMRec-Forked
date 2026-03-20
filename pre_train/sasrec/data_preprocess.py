@@ -107,7 +107,11 @@ def preprocess(fname):
     
     with open(f'../../data/amazon/{fname}_text_name_dict.json.gz', 'wb') as tf:
         pickle.dump(name_dict, tf)
-    
+
+    id_to_asin = {v: k for k, v in itemmap.items()}
+    with open(f'../../data/amazon/{fname}_id_to_asin.json.gz', 'wb') as tf:
+        pickle.dump(id_to_asin, tf)
+
     for userid in User.keys():
         User[userid].sort(key=lambda x: x[0])
         
