@@ -59,12 +59,12 @@ class llm4rec(nn.Module):
                 _attn_implementation="flash_attention_2" if torch.cuda.is_available() else "eager",
                 device_map="auto",
             )
-            # SmolVLM uses Idefics3Processor; we only need the text tokenizer
-            # for A-LLMRec's prompt assembly and embedding injection.
+            # SmolVLM uses Idefics3Processor. We keep the full processor so that
+            # image inputs can be processed alongside text in Stage 2.
             # bos=<|im_start|>, eos/pad=<|im_end|>, unk=<|endoftext|> are
             # already correctly defined — do NOT override them.
-            _processor = AutoProcessor.from_pretrained("HuggingFaceTB/SmolVLM-Instruct")
-            self.llm_tokenizer = _processor.tokenizer
+            self.processor = AutoProcessor.from_pretrained("HuggingFaceTB/SmolVLM-Instruct")
+            self.llm_tokenizer = self.processor.tokenizer
 
         else:
             raise Exception(f"{llm_model} is not supported")
@@ -185,22 +185,40 @@ class llm4rec(nn.Module):
         # Attention mask for the prepended user representation token.
         atts_llm = torch.ones(log_emb.size()[:-1], dtype=torch.long).to(self.device)
         atts_llm = atts_llm.unsqueeze(1)
-            
+
         # Tokenize the target text (e.g., correct item title) and append EOS.
+        # Output is always text-only, so we always use the plain tokenizer here.
         text_output_tokens = self.llm_tokenizer(
             [t + self.llm_tokenizer.eos_token for t in samples['text_output']],
             return_tensors="pt",
             padding="longest",
             truncation=False,
         ).to(self.device)
-        
-        text_input_tokens = self.llm_tokenizer(
-            samples['text_input'],
-            return_tensors="pt",
-            padding="longest",
-            truncation=False,
-        ).to(self.device)
-        
+
+        # Tokenize the input prompt. When images are present (SmolVLM path) we
+        # use the full Idefics3Processor so that <image> placeholders in the
+        # text are expanded to the correct number of image-token IDs and
+        # pixel_values are returned for the vision encoder.
+        if samples.get('images') is not None:
+            processed = self.processor(
+                text=samples['text_input'],
+                images=samples['images'],
+                return_tensors="pt",
+                padding="longest",
+            ).to(self.device)
+            text_input_tokens = processed
+            pixel_values = processed.pixel_values
+            image_attention_mask = processed.get('image_attention_mask')
+        else:
+            text_input_tokens = self.llm_tokenizer(
+                samples['text_input'],
+                return_tensors="pt",
+                padding="longest",
+                truncation=False,
+            ).to(self.device)
+            pixel_values = None
+            image_attention_mask = None
+
         # Merge input and output tokens into a single sequence for each example.
         llm_tokens, input_part_targets_len = self.concat_text_input_output(
             text_input_tokens.input_ids,
@@ -215,26 +233,46 @@ class llm4rec(nn.Module):
         # Ignore the prompt (input) part in the loss; only train on the answer.
         for i, l in enumerate(input_part_targets_len):
             targets[i][:l] = -100
-        
+
         # Also ignore the prepended user representation token.
         empty_targets = (torch.ones(atts_llm.size(), dtype=torch.long).to(self.device).fill_(-100))
 
         targets = torch.cat([empty_targets, targets], dim=1)
-        
+
         # Convert tokens to embeddings, then inject history/candidate item embeddings.
         inputs_embeds = self.llm_model.get_input_embeddings()(llm_tokens['input_ids'])
         llm_tokens, inputs_embeds = self.replace_hist_candi_token(llm_tokens, inputs_embeds, samples['interact'], samples['candidate'])
         attention_mask = llm_tokens['attention_mask']
-        
+
         # Prepend the user representation embedding as the first token (soft prompt).
         log_emb = log_emb.unsqueeze(1)
         inputs_embeds = torch.cat([log_emb, inputs_embeds], dim=1)
         attention_mask = torch.cat([atts_llm, llm_tokens['attention_mask']], dim=1)
-        
+
+        # When pixel_values are present (SmolVLM path), Idefics3's inputs_merger
+        # uses input_ids to locate <image> token positions in inputs_embeds.
+        # inputs_embeds has had the user-rep token prepended (line above), making
+        # it one token longer than llm_tokens['input_ids'].  We prepend a single
+        # pad token so both tensors have identical sequence length; the pad id is
+        # not the image-token id, so Idefics3 leaves position-0 (user-rep) alone.
+        if pixel_values is not None:
+            dummy = torch.full(
+                (llm_tokens['input_ids'].size(0), 1),
+                self.llm_tokenizer.pad_token_id,
+                dtype=torch.long,
+                device=self.device,
+            )
+            input_ids_for_model = torch.cat([dummy, llm_tokens['input_ids']], dim=1)
+        else:
+            input_ids_for_model = llm_tokens['input_ids']
+
         with torch.cuda.amp.autocast():
             outputs = self.llm_model(
+                input_ids=input_ids_for_model,
                 inputs_embeds=inputs_embeds,
                 attention_mask=attention_mask,
+                pixel_values=pixel_values,
+                image_attention_mask=image_attention_mask,
                 return_dict=True,
                 labels=targets,
             )

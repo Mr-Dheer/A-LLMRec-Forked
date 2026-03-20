@@ -1,3 +1,4 @@
+import os
 import random
 import pickle
 
@@ -5,6 +6,7 @@ import torch
 from torch.cuda.amp import autocast as autocast
 import torch.nn as nn
 import numpy as np
+from PIL import Image
 
 from models.recsys_model import *
 from models.llm4rec import *
@@ -49,7 +51,15 @@ class A_llmrec_model(nn.Module):
         
         with open(f'./data/amazon/{args.rec_pre_trained_data}_text_name_dict.json.gz','rb') as ft:
             self.text_name_dict = pickle.load(ft)
-        
+
+        id_to_asin_path = f'./data/amazon/{args.rec_pre_trained_data}_id_to_asin.json.gz'
+        if os.path.exists(id_to_asin_path):
+            with open(id_to_asin_path, 'rb') as f:
+                self.id_to_asin = pickle.load(f)
+        else:
+            self.id_to_asin = {}
+        self.image_dir = f'./data/images/{args.rec_pre_trained_data}'
+
         self.recsys = RecSys(args.recsys, rec_pre_trained_data, self.device)
         self.item_num = self.recsys.item_num
         self.rec_sys_dim = self.recsys.hidden_units
@@ -165,6 +175,30 @@ class A_llmrec_model(nn.Module):
         elif not title_flag and description_flag:
             return f'"{self.text_name_dict[d].get(item,d_)}"'
         
+    def load_history_images(self, item_ids, n=5):
+        """
+        Load the last n product images for the given item_ids sequence.
+
+        Maps each integer item_id to its ASIN via self.id_to_asin, then loads
+        the corresponding JPEG from self.image_dir.  If the image file is
+        missing or corrupt, a 100×100 black RGB image is used as a fallback.
+        The returned list always contains exactly n PIL Images (padded at the
+        front with black images if the history is shorter than n).
+        """
+        black = Image.fromarray(np.zeros((100, 100, 3), dtype=np.uint8))
+        images = []
+        for item_id in list(item_ids)[-n:]:
+            asin = self.id_to_asin.get(int(item_id))
+            path = os.path.join(self.image_dir, f'{asin}.jpg') if asin else None
+            try:
+                img = Image.open(path).convert('RGB') if (path and os.path.exists(path)) else black
+            except Exception:
+                img = black
+            images.append(img)
+        while len(images) < n:
+            images.insert(0, black)
+        return images
+
     def get_item_emb(self, item_ids):
         """
         Get CF item embeddings and map them into the shared latent space (128-d).
@@ -285,12 +319,17 @@ class A_llmrec_model(nn.Module):
             
         print("loss in epoch {}/{} iteration {}/{}: {} / BPR loss: {} / Matching loss: {} / Item reconstruction: {} / Text reconstruction: {}".format(epoch, total_epoch, step, total_step, mean_loss/iterss, bpr_loss/iterss, gt_loss/iterss, rc_loss/iterss, text_rc_loss/iterss))
     
-    def make_interact_text(self, interact_ids, interact_max_num):
+    def make_interact_text(self, interact_ids, interact_max_num, use_images=False):
         """
         Build the textual part of the user history for the LLM prompt.
 
         Appends a special marker [HistoryEmb] to each title so we can
         later replace it with the aligned item embedding in the LLM input.
+
+        When use_images=True (SmolVLM path), the last 5 items in the slice
+        also get an <image> token appended directly after [HistoryEmb].  The
+        Idefics3Processor will expand each <image> into the correct sequence
+        of visual-patch tokens when the prompt is tokenized.
         """
         interact_item_titles_ = self.find_item_text(interact_ids, title_flag=True, description_flag=False)
         interact_text = []
@@ -298,10 +337,14 @@ class A_llmrec_model(nn.Module):
             for title in interact_item_titles_:
                 interact_text.append(title + '[HistoryEmb]')
         else:
-            for title in interact_item_titles_[-interact_max_num:]:
-                interact_text.append(title + '[HistoryEmb]')
+            titles_slice = interact_item_titles_[-interact_max_num:]
+            for j, title in enumerate(titles_slice):
+                suffix = '[HistoryEmb]'
+                if use_images and j >= len(titles_slice) - 5:
+                    suffix += '<image>'
+                interact_text.append(title + suffix)
             interact_ids = interact_ids[-interact_max_num:]
-            
+
         interact_text = ','.join(interact_text)
         return interact_text, interact_ids
     
@@ -339,52 +382,60 @@ class A_llmrec_model(nn.Module):
           - Project CF user representations and joint item embeddings into
             the LLM token space
           - Optimize to predict the correct next item title
+
+        When using SmolVLM, the last 5 history items also have <image> tokens
+        in the prompt and their PIL images are collected into images_batch so
+        that Idefics3Processor can process them together with the text.
         """
         epoch, total_epoch, step, total_step = batch_iter
-        
+
         optimizer.zero_grad()
         u, seq, pos, neg = data
         mean_loss = 0
-        
+
         text_input = []
         text_output = []
         interact_embs = []
         candidate_embs = []
+        images_batch = []
         self.llm.eval()
-        
+
+        use_images = (self.args.llm == 'smolvlm')
+
         # Get CF user representations for the batch (frozen CF-RecSys).
         with torch.no_grad():
             log_emb = self.recsys.model(u,seq,pos,neg, mode = 'log_only')
-            
+
         for i in range(len(u)):
             # Use the last positive item as the target (next item).
             target_item_id = pos[i][-1]
             target_item_title = self.find_item_text_single(target_item_id, title_flag=True, description_flag=False)
-            
+
             # User interaction history (titles + [HistoryEmb] markers).
-            interact_text, interact_ids = self.make_interact_text(seq[i][seq[i]>0], 10)
+            # For SmolVLM, the last 5 also get <image> appended.
+            interact_text, interact_ids = self.make_interact_text(seq[i][seq[i]>0], 10, use_images=use_images)
             candidate_num = 20
             candidate_text, candidate_ids = self.make_candidate_text(seq[i][seq[i]>0], candidate_num, target_item_id, target_item_title)
-            
+
             input_text = ''
             input_text += ' is a user representation.'
-                
+
             if self.args.rec_pre_trained_data == 'Movies_and_TV':
                 input_text += 'This user has watched '
             elif self.args.rec_pre_trained_data == 'Video_Games':
                 input_text += 'This user has played '
-            elif self.args.rec_pre_trained_data == 'Luxury_Beauty' or self.args.rec_pre_trained_data == 'Toys_and_Games':
+            else:
                 input_text += 'This user has bought '
-                
+
             input_text += interact_text
-            
+
             if self.args.rec_pre_trained_data == 'Movies_and_TV':
                 input_text +=' in the previous. Recommend one next movie for this user to watch next from the following movie title set, '
             elif self.args.rec_pre_trained_data == 'Video_Games':
-                input_text +=' in the previous. Recommend one next game for this user to play next from the following game title set, '            
-            elif self.args.rec_pre_trained_data == 'Luxury_Beauty' or self.args.rec_pre_trained_data == 'Toys_and_Games':
+                input_text +=' in the previous. Recommend one next game for this user to play next from the following game title set, '
+            else:
                 input_text +=' in the previous. Recommend one next item for this user to buy next from the following item title set, '
-                    
+
             input_text += candidate_text
             input_text += '. The recommendation is '
 
@@ -395,8 +446,20 @@ class A_llmrec_model(nn.Module):
             # history and candidate items.
             interact_embs.append(self.item_emb_proj(self.get_item_emb(interact_ids)))
             candidate_embs.append(self.item_emb_proj(self.get_item_emb(candidate_ids)))
-            
-        samples = {'text_input': text_input, 'text_output': text_output, 'interact': interact_embs, 'candidate':candidate_embs}
+
+            # Collect images for the last min(5, history_len) history items (SmolVLM only).
+            # Must match the number of <image> tokens emitted by make_interact_text.
+            if use_images:
+                n_images = min(5, len(interact_ids[-10:]))
+                images_batch.append(self.load_history_images(interact_ids, n=n_images))
+
+        samples = {
+            'text_input': text_input,
+            'text_output': text_output,
+            'interact': interact_embs,
+            'candidate': candidate_embs,
+            'images': images_batch if use_images else None,
+        }
         # Project CF user representations into LLM token space.
         log_emb = self.log_emb_proj(log_emb)
         loss_rm = self.llm(log_emb, samples)
@@ -410,80 +473,126 @@ class A_llmrec_model(nn.Module):
         Inference routine:
           - Build prompts and aligned embeddings as in Stage 2 training
           - Call the frozen LLM generate() API to get text outputs
+
+        When using SmolVLM, the last 5 history items have <image> tokens in the
+        prompt.  The full Idefics3Processor tokenizes text + images together,
+        returning expanded input_ids and pixel_values which are passed to
+        llm_model.generate() so the vision encoder can inject visual features.
         """
         u, seq, pos, neg, rank = data
-        
+
+        use_images = (self.args.llm == 'smolvlm')
+
         answer = []
         text_input = []
         interact_embs = []
         candidate_embs = []
+        images_batch = []
         with torch.no_grad():
             log_emb = self.recsys.model(u,seq,pos,neg, mode = 'log_only')
             for i in range(len(u)):
                 target_item_id = pos[i]
                 target_item_title = self.find_item_text_single(target_item_id, title_flag=True, description_flag=False)
-                
-                interact_text, interact_ids = self.make_interact_text(seq[i][seq[i]>0], 10)
+
+                interact_text, interact_ids = self.make_interact_text(seq[i][seq[i]>0], 10, use_images=use_images)
                 candidate_num = 20
                 candidate_text, candidate_ids = self.make_candidate_text(seq[i][seq[i]>0], candidate_num, target_item_id, target_item_title)
-                
+
                 input_text = ''
                 input_text += ' is a user representation.'
                 if self.args.rec_pre_trained_data == 'Movies_and_TV':
                     input_text += 'This user has watched '
                 elif self.args.rec_pre_trained_data == 'Video_Games':
                     input_text += 'This user has played '
-                elif self.args.rec_pre_trained_data == 'Luxury_Beauty' or self.args.rec_pre_trained_data == 'Toys_and_Games':
+                else:
                     input_text += 'This user has bought '
-                    
+
                 input_text += interact_text
-                
+
                 if self.args.rec_pre_trained_data == 'Movies_and_TV':
                     input_text +=' in the previous. Recommend one next movie for this user to watch next from the following movie title set, '
                 elif self.args.rec_pre_trained_data == 'Video_Games':
-                    input_text +=' in the previous. Recommend one next game for this user to play next from the following game title set, '            
-                elif self.args.rec_pre_trained_data == 'Luxury_Beauty' or self.args.rec_pre_trained_data == 'Toys_and_Games':
+                    input_text +=' in the previous. Recommend one next game for this user to play next from the following game title set, '
+                else:
                     input_text +=' in the previous. Recommend one next item for this user to buy next from the following item title set, '
-                
+
                 input_text += candidate_text
                 input_text += '. The recommendation is '
 
                 answer.append(target_item_title)
                 text_input.append(self.llm.wrap_prompt(input_text))
-                
+
                 # Pre-compute projected embeddings for history and candidates.
                 interact_embs.append(self.item_emb_proj(self.get_item_emb(interact_ids)))
                 candidate_embs.append(self.item_emb_proj(self.get_item_emb(candidate_ids)))
-        
+
+                # Collect images for the last min(5, history_len) history items (SmolVLM only).
+                # Must match the number of <image> tokens emitted by make_interact_text.
+                if use_images:
+                    n_images = min(5, len(interact_ids[-10:]))
+                    images_batch.append(self.load_history_images(interact_ids, n=n_images))
+
         # Add user representation token at the beginning of the LLM input.
         log_emb = self.log_emb_proj(log_emb)
         atts_llm = torch.ones(log_emb.size()[:-1], dtype=torch.long).to(self.device)
         atts_llm = atts_llm.unsqueeze(1)
         log_emb = log_emb.unsqueeze(1)
-        
+
         with torch.no_grad():
-            self.llm.llm_tokenizer.padding_side = "left"
-            llm_tokens = self.llm.llm_tokenizer(
-                text_input,
-                padding="longest",
-                return_tensors="pt"
-            ).to(self.device)
-            
+            # Tokenize: use full processor for SmolVLM (expands <image> tokens
+            # and prepares pixel_values), plain tokenizer for OPT.
+            if use_images:
+                self.llm.processor.tokenizer.padding_side = "left"
+                processed = self.llm.processor(
+                    text=text_input,
+                    images=images_batch,
+                    padding="longest",
+                    return_tensors="pt",
+                ).to(self.device)
+                llm_tokens = processed
+                pixel_values = processed.pixel_values
+                image_attention_mask = processed.get('image_attention_mask')
+            else:
+                self.llm.llm_tokenizer.padding_side = "left"
+                llm_tokens = self.llm.llm_tokenizer(
+                    text_input,
+                    padding="longest",
+                    return_tensors="pt"
+                ).to(self.device)
+                pixel_values = None
+                image_attention_mask = None
+
             with torch.cuda.amp.autocast():
                 inputs_embeds = self.llm.llm_model.get_input_embeddings()(llm_tokens.input_ids)
-                
+
                 # Replace [HistoryEmb] / [CandidateEmb] token positions with
                 # the projected joint item embeddings in the embedding matrix.
                 llm_tokens, inputs_embeds = self.llm.replace_hist_candi_token(llm_tokens, inputs_embeds, interact_embs, candidate_embs)
-                    
+
                 attention_mask = llm_tokens.attention_mask
                 # Prepend the user representation embedding at the very front.
                 inputs_embeds = torch.cat([log_emb, inputs_embeds], dim=1)
                 attention_mask = torch.cat([atts_llm, llm_tokens.attention_mask], dim=1)
-                    
+
+                # Prepend a dummy pad token so input_ids length matches
+                # inputs_embeds (which has the extra user-rep token at pos 0).
+                if pixel_values is not None:
+                    dummy = torch.full(
+                        (llm_tokens.input_ids.size(0), 1),
+                        self.llm.llm_tokenizer.pad_token_id,
+                        dtype=torch.long,
+                        device=self.device,
+                    )
+                    input_ids_for_model = torch.cat([dummy, llm_tokens.input_ids], dim=1)
+                else:
+                    input_ids_for_model = llm_tokens.input_ids
+
                 outputs = self.llm.llm_model.generate(
+                    input_ids=input_ids_for_model,
                     inputs_embeds=inputs_embeds,
                     attention_mask=attention_mask,
+                    pixel_values=pixel_values,
+                    image_attention_mask=image_attention_mask,
                     do_sample=False,
                     top_p=0.9,
                     temperature=1,
@@ -503,15 +612,9 @@ class A_llmrec_model(nn.Module):
 
         for i in range(len(text_input)):
             f = open(f'/home/kavach/Dev/idea-3/A-LLMRec-Forked/results/smol/recommendation_output_smol_v1_2B.txt','a')
-            # f.write(text_input[i])
-            # f.write('\n\n')
-            
             f.write('Answer: ' + str(answer[i]) + '\n\n')
             f.write('LLM: ' + str(output_text[i]) + '\n\n')
             f.write('--------------------------------\n\n')
-
-            
-
             f.close()
 
-        return output_text      
+        return output_text
