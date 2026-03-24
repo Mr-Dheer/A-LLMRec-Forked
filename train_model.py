@@ -15,12 +15,47 @@ from torch.distributed import init_process_group, destroy_process_group
 from models.a_llmrec_model import *
 from pre_train.sasrec.utils import data_partition, SeqDataset, SeqDataset_Inference
 
+try:
+    import wandb
+except ImportError:
+    wandb = None
+
 
 def setup_ddp(rank, world_size):
     os.environ ["MASTER_ADDR"] = "localhost"
     os.environ ["MASTER_PORT"] = "12355"
     init_process_group(backend="nccl", rank=rank, world_size=world_size)
     torch.cuda.set_device(rank)
+
+
+def _should_use_wandb(args, rank):
+    return bool(getattr(args, "use_wandb", False)) and rank == 0
+
+
+def _setup_wandb(args, rank, phase):
+    if not _should_use_wandb(args, rank):
+        return None
+    if wandb is None:
+        raise ImportError("Weights & Biases is not installed. Run `pip install wandb` and try again.")
+    config = {
+        "phase": phase,
+        "llm": args.llm,
+        "recsys": args.recsys,
+        "dataset": args.rec_pre_trained_data,
+        "num_epochs": args.num_epochs,
+        "batch_size1": args.batch_size1,
+        "batch_size2": args.batch_size2,
+        "maxlen": args.maxlen,
+        "stage1_lr": args.stage1_lr,
+        "stage2_lr": args.stage2_lr,
+        "multi_gpu": args.multi_gpu,
+    }
+    return wandb.init(
+        project=args.wandb_project,
+        name=args.wandb_run_name,
+        config=config,
+        reinit=True,
+    )
     
 def train_model_phase1(args):
     print('A-LLMRec start train phase-1\n')
@@ -71,18 +106,34 @@ def train_model_phase1_(rank, world_size, args):
         train_data_loader = DataLoader(train_data_set, batch_size = args.batch_size1, pin_memory=True)        
         
     adam_optimizer = torch.optim.Adam(model.parameters(), lr=args.stage1_lr, betas=(0.9, 0.98))
+    wandb_run = _setup_wandb(args, rank, phase="phase1")
     
     epoch_start_idx = 1
     T = 0.0
     model.train()
     t0 = time.time()
+    global_step = 0
     for epoch in tqdm(range(epoch_start_idx, args.num_epochs + 1)):
         if args.multi_gpu:
             train_data_loader.sampler.set_epoch(epoch)
         for step, data in enumerate(train_data_loader):
             u, seq, pos, neg = data
             u, seq, pos, neg = u.numpy(), seq.numpy(), pos.numpy(), neg.numpy()
-            model([u,seq,pos,neg], optimizer=adam_optimizer, batch_iter=[epoch,args.num_epochs + 1,step,num_batch], mode='phase1')
+            metrics = model([u,seq,pos,neg], optimizer=adam_optimizer, batch_iter=[epoch,args.num_epochs + 1,step,num_batch], mode='phase1')
+            global_step += 1
+            if _should_use_wandb(args, rank) and (global_step % max(1, args.wandb_log_interval) == 0):
+                wandb.log(
+                    {
+                        "phase1/loss": metrics["loss"],
+                        "phase1/bpr_loss": metrics["bpr_loss"],
+                        "phase1/matching_loss": metrics["matching_loss"],
+                        "phase1/item_reconstruction_loss": metrics["item_reconstruction_loss"],
+                        "phase1/text_reconstruction_loss": metrics["text_reconstruction_loss"],
+                        "phase1/epoch": epoch,
+                        "phase1/step_in_epoch": step,
+                    },
+                    step=global_step,
+                )
             if step % max(10,num_batch//100) ==0:
                 if rank ==0:
                     if args.multi_gpu: model.module.save_model(args, epoch1=epoch)
@@ -92,6 +143,8 @@ def train_model_phase1_(rank, world_size, args):
             else: model.save_model(args, epoch1=epoch)
 
     print('train time :', time.time() - t0)
+    if wandb_run is not None:
+        wandb.finish()
     if args.multi_gpu:
         destroy_process_group()
     return 
@@ -122,18 +175,30 @@ def train_model_phase2_(rank,world_size,args):
     else:
         train_data_loader = DataLoader(train_data_set, batch_size = args.batch_size2, pin_memory=True, shuffle=True)
     adam_optimizer = torch.optim.Adam(model.parameters(), lr=args.stage2_lr, betas=(0.9, 0.98))
+    wandb_run = _setup_wandb(args, rank, phase="phase2")
     
     epoch_start_idx = 1
     T = 0.0
     model.train()
     t0 = time.time()
+    global_step = 0
     for epoch in tqdm(range(epoch_start_idx, args.num_epochs + 1)):
         if args.multi_gpu:
             train_data_loader.sampler.set_epoch(epoch)
         for step, data in enumerate(train_data_loader):
             u, seq, pos, neg = data
             u, seq, pos, neg = u.numpy(), seq.numpy(), pos.numpy(), neg.numpy()
-            model([u,seq,pos,neg], optimizer=adam_optimizer, batch_iter=[epoch,args.num_epochs + 1,step,num_batch], mode='phase2')
+            metrics = model([u,seq,pos,neg], optimizer=adam_optimizer, batch_iter=[epoch,args.num_epochs + 1,step,num_batch], mode='phase2')
+            global_step += 1
+            if _should_use_wandb(args, rank) and (global_step % max(1, args.wandb_log_interval) == 0):
+                wandb.log(
+                    {
+                        "phase2/loss": metrics["loss"],
+                        "phase2/epoch": epoch,
+                        "phase2/step_in_epoch": step,
+                    },
+                    step=global_step,
+                )
             if step % max(10,num_batch//100) ==0:
                 if rank ==0:
                     if args.multi_gpu: model.module.save_model(args, epoch1=phase1_epoch, epoch2=epoch)
@@ -143,6 +208,8 @@ def train_model_phase2_(rank,world_size,args):
             else: model.save_model(args, epoch1=phase1_epoch, epoch2=epoch)
     
     print('phase2 train time :', time.time() - t0)
+    if wandb_run is not None:
+        wandb.finish()
     if args.multi_gpu:
         destroy_process_group()
     return
@@ -154,7 +221,7 @@ def inference_(rank, world_size, args):
         
     model = A_llmrec_model(args).to(args.device)
     phase1_epoch = 10
-    phase2_epoch = 5
+    phase2_epoch = args.num_epochs
     model.load_model(args, phase1_epoch=phase1_epoch, phase2_epoch=phase2_epoch)
 
     dataset = data_partition(args.rec_pre_trained_data, path=f'./data/amazon/{args.rec_pre_trained_data}.txt')

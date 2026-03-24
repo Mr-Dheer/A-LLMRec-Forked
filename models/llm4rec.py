@@ -1,5 +1,8 @@
 import torch
 import torch.nn as nn
+import json
+import time
+import uuid
 
 from transformers import (
     AutoModelForVision2Seq,
@@ -7,7 +10,9 @@ from transformers import (
     AutoTokenizer,
     BitsAndBytesConfig,
     OPTForCausalLM,
+    AutoModelForImageTextToText
 )
+from peft import LoraConfig, get_peft_model
 
 
 class llm4rec(nn.Module):
@@ -29,12 +34,21 @@ class llm4rec(nn.Module):
         device,
         llm_model="",
         max_output_txt_len=256,
+        load_in_4bit=False,
     ):
         super().__init__()
         self.device = device
 
         if llm_model == "opt":
-            bnb_config = BitsAndBytesConfig(load_in_8bit=True)
+            if load_in_4bit:
+                bnb_config = BitsAndBytesConfig(
+                    load_in_4bit=True,
+                    bnb_4bit_quant_type="nf4",
+                    bnb_4bit_use_double_quant=True,
+                    bnb_4bit_compute_dtype=torch.bfloat16,
+                )
+            else:
+                bnb_config = BitsAndBytesConfig(load_in_8bit=True)
             self.llm_model = OPTForCausalLM.from_pretrained(
                 "facebook/opt-6.7b",
                 quantization_config=bnb_config,
@@ -53,17 +67,32 @@ class llm4rec(nn.Module):
             self.llm_tokenizer.add_special_tokens({'unk_token': '</s>'})
 
         elif llm_model == "smolvlm":
-            self.llm_model = AutoModelForVision2Seq.from_pretrained(
-                "HuggingFaceTB/SmolVLM-Instruct",
-                torch_dtype=torch.bfloat16,
-                _attn_implementation="flash_attention_2" if torch.cuda.is_available() else "eager",
-                device_map="auto",
+            model_kwargs = {
+                "_attn_implementation": "flash_attention_2",
+                "device_map": {"": 0},
+            }
+            if load_in_4bit:
+                model_kwargs["quantization_config"] = BitsAndBytesConfig(
+                    load_in_4bit=True,
+                    bnb_4bit_quant_type="nf4",
+                    bnb_4bit_use_double_quant=True,
+                    bnb_4bit_compute_dtype=torch.bfloat16,
+                )
+            else:
+                model_kwargs["torch_dtype"] = torch.bfloat16
+
+            self.llm_model = AutoModelForImageTextToText.from_pretrained(
+                "HuggingFaceTB/SmolVLM2-2.2B-Instruct",
+                **model_kwargs,
             )
-            # SmolVLM uses Idefics3Processor. We keep the full processor so that
+            # SmolVLM2 uses Idefics3Processor. We keep the full processor so that
             # image inputs can be processed alongside text in Stage 2.
             # bos=<|im_start|>, eos/pad=<|im_end|>, unk=<|endoftext|> are
             # already correctly defined — do NOT override them.
-            self.processor = AutoProcessor.from_pretrained("HuggingFaceTB/SmolVLM-Instruct")
+            self.processor = AutoProcessor.from_pretrained(
+                "HuggingFaceTB/SmolVLM2-2.2B-Instruct",
+                do_image_splitting=False,
+            )
             self.llm_tokenizer = self.processor.tokenizer
 
         else:
@@ -80,6 +109,20 @@ class llm4rec(nn.Module):
         # Freeze all LLM weights; only surrounding projection heads are trainable.
         for _, param in self.llm_model.named_parameters():
             param.requires_grad = False
+
+        # Apply LoRA to SmolVLM after freezing base weights.
+        # LoRA adds small trainable adapter matrices (A, B) alongside frozen
+        # attention projections. Only these new parameters have requires_grad=True.
+        # Must be applied AFTER the freeze loop above so the loop doesn't touch them.
+        if llm_model == "smolvlm":
+            lora_config = LoraConfig(
+                r=16,
+                lora_alpha=32,
+                target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
+                lora_dropout=0.05,
+                bias="none",
+            )
+            self.llm_model = get_peft_model(self.llm_model, lora_config)
 
         self.max_output_txt_len = max_output_txt_len
         self._llm_model_name = llm_model
@@ -168,6 +211,22 @@ class llm4rec(nn.Module):
             for idx, item_emb in zip(idx_tensor, candidate_embs[inx]):
                 inputs_embeds[inx][idx]=item_emb
         return llm_tokens, inputs_embeds
+
+    def _debug_log(self, hypothesis_id, location, message, data, run_id="pre-fix"):
+        payload = {
+            "id": f"log_{int(time.time() * 1000)}_{uuid.uuid4().hex[:8]}",
+            "timestamp": int(time.time() * 1000),
+            "runId": run_id,
+            "hypothesisId": hypothesis_id,
+            "location": location,
+            "message": message,
+            "data": data,
+        }
+        try:
+            with open("/users/kavach_d/projects/idea-3/.cursor/debug.log", "a", encoding="utf-8") as f:
+                f.write(json.dumps(payload, ensure_ascii=True) + "\n")
+        except Exception:
+            pass
     
     def forward(self, log_emb, samples):
         """
@@ -200,15 +259,75 @@ class llm4rec(nn.Module):
         # text are expanded to the correct number of image-token IDs and
         # pixel_values are returned for the vision encoder.
         if samples.get('images') is not None:
-            processed = self.processor(
-                text=samples['text_input'],
-                images=samples['images'],
-                return_tensors="pt",
-                padding="longest",
-            ).to(self.device)
-            text_input_tokens = processed
-            pixel_values = processed.pixel_values
-            image_attention_mask = processed.get('image_attention_mask')
+            image_groups = samples['images']
+            image_group_lengths = [len(g) if isinstance(g, list) else -1 for g in image_groups]
+            image_token_counts = [t.count("<image>") for t in samples['text_input']]
+            has_any_nonempty_image_group = any(v > 0 for v in image_group_lengths)
+            # region agent log
+            self._debug_log(
+                "H1_H2_H5",
+                "models/llm4rec.py:247",
+                "processor_inputs_summary",
+                {
+                    "batch_size_text": int(len(samples['text_input'])),
+                    "batch_size_images": int(len(image_groups)),
+                    "image_group_lengths_first10": image_group_lengths[:10],
+                    "empty_image_group_count": int(sum(1 for v in image_group_lengths if v == 0)),
+                    "image_token_counts_first10": image_token_counts[:10],
+                    "has_any_nonempty_image_group": bool(has_any_nonempty_image_group),
+                },
+                run_id="post-fix",
+            )
+            # endregion
+            if has_any_nonempty_image_group:
+                try:
+                    processed = self.processor(
+                        text=samples['text_input'],
+                        images=image_groups,
+                        return_tensors="pt",
+                        padding="longest",
+                    ).to(self.device)
+                except Exception as e:
+                    # region agent log
+                    self._debug_log(
+                        "H3",
+                        "models/llm4rec.py:267",
+                        "processor_call_exception",
+                        {
+                            "error_type": type(e).__name__,
+                            "error": str(e),
+                            "batch_size_text": int(len(samples['text_input'])),
+                            "batch_size_images": int(len(image_groups)),
+                        },
+                        run_id="post-fix",
+                    )
+                    # endregion
+                    raise
+                text_input_tokens = processed
+                pixel_values = processed.pixel_values
+                image_attention_mask = processed.get('image_attention_mask')
+            else:
+                # region agent log
+                self._debug_log(
+                    "H1",
+                    "models/llm4rec.py:281",
+                    "fallback_to_text_only_tokenizer_due_to_empty_image_groups",
+                    {
+                        "batch_size_text": int(len(samples['text_input'])),
+                        "image_group_lengths_first10": image_group_lengths[:10],
+                        "image_token_counts_first10": image_token_counts[:10],
+                    },
+                    run_id="post-fix",
+                )
+                # endregion
+                text_input_tokens = self.llm_tokenizer(
+                    samples['text_input'],
+                    return_tensors="pt",
+                    padding="longest",
+                    truncation=False,
+                ).to(self.device)
+                pixel_values = None
+                image_attention_mask = None
         else:
             text_input_tokens = self.llm_tokenizer(
                 samples['text_input'],

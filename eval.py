@@ -42,8 +42,8 @@ if __name__ == "__main__":
     parser.add_argument(
         '--file',
         type=str,
-        default='/home/kavach/Dev/idea-3/A-LLMRec-Forked/recommendation_output_id.txt',
-        help='Path to the inference output file (default: ./recommendation_output.txt)',
+        default='./results/smol/recommendation_output_smol_v1_2B.txt',
+        help='Path to the inference output file (default: ./results/smol/recommendation_output_smol_v1_2B.txt)',
     )
     args = parser.parse_args()
 

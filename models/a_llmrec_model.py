@@ -1,6 +1,9 @@
 import os
 import random
 import pickle
+import json
+import time
+import uuid
 
 import torch
 from torch.cuda.amp import autocast as autocast
@@ -88,7 +91,11 @@ class A_llmrec_model(nn.Module):
         # Stage 2 components (LLM and projection heads) are only needed
         # when training Stage 2 or doing inference.
         if args.pretrain_stage2 or args.inference:
-            self.llm = llm4rec(device=self.device, llm_model=args.llm)
+            self.llm = llm4rec(
+                device=self.device,
+                llm_model=args.llm,
+                load_in_4bit=args.load_in_4bit,
+            )
             
             self.log_emb_proj = nn.Sequential(
                 nn.Linear(self.rec_sys_dim, self.llm.llm_hidden_size),
@@ -123,6 +130,10 @@ class A_llmrec_model(nn.Module):
         if args.pretrain_stage2:
             torch.save(self.log_emb_proj.state_dict(), out_dir + 'log_proj.pt')
             torch.save(self.item_emb_proj.state_dict(), out_dir + 'item_proj.pt')
+            # Save LoRA adapter weights (SmolVLM only).
+            if args.llm == 'smolvlm':
+                lora_state = {k: v for k, v in self.llm.llm_model.state_dict().items() if 'lora_' in k}
+                torch.save(lora_state, out_dir + 'lora.pt')
             
     def load_model(self, args, phase1_epoch=None, phase2_epoch=None):
         out_dir = f'./models/saved_models/{args.rec_pre_trained_data}_{args.recsys}_{phase1_epoch}_'
@@ -136,14 +147,19 @@ class A_llmrec_model(nn.Module):
 
         if args.inference:
             out_dir += f'{args.llm}_{phase2_epoch}_'
-            
+
             log_emb_proj_dict = torch.load(out_dir + 'log_proj.pt', map_location = args.device)
             self.log_emb_proj.load_state_dict(log_emb_proj_dict)
             del log_emb_proj_dict
-            
+
             item_emb_proj_dict = torch.load(out_dir + 'item_proj.pt', map_location = args.device)
             self.item_emb_proj.load_state_dict(item_emb_proj_dict)
             del item_emb_proj_dict
+
+            # Load LoRA adapter weights (SmolVLM only).
+            if args.llm == 'smolvlm':
+                lora_state = torch.load(out_dir + 'lora.pt', map_location=args.device)
+                self.llm.llm_model.load_state_dict(lora_state, strict=False)
 
     def find_item_text(self, item, title_flag=True, description_flag=True):
         """
@@ -199,6 +215,22 @@ class A_llmrec_model(nn.Module):
             images.insert(0, black)
         return images
 
+    def _debug_log(self, hypothesis_id, location, message, data, run_id="pre-fix"):
+        payload = {
+            "id": f"log_{int(time.time() * 1000)}_{uuid.uuid4().hex[:8]}",
+            "timestamp": int(time.time() * 1000),
+            "runId": run_id,
+            "hypothesisId": hypothesis_id,
+            "location": location,
+            "message": message,
+            "data": data,
+        }
+        try:
+            with open("/users/kavach_d/projects/idea-3/.cursor/debug.log", "a", encoding="utf-8") as f:
+                f.write(json.dumps(payload, ensure_ascii=True) + "\n")
+        except Exception:
+            pass
+
     def get_item_emb(self, item_ids):
         """
         Get CF item embeddings and map them into the shared latent space (128-d).
@@ -220,11 +252,12 @@ class A_llmrec_model(nn.Module):
           - mode='generate': inference / text generation
         """
         if mode == 'phase1':
-            self.pre_train_phase1(data, optimizer, batch_iter)
+            return self.pre_train_phase1(data, optimizer, batch_iter)
         if mode == 'phase2':
-            self.pre_train_phase2(data, optimizer, batch_iter)
+            return self.pre_train_phase2(data, optimizer, batch_iter)
         if mode =='generate':
-            self.generate(data)
+            return self.generate(data)
+        return None
 
     def pre_train_phase1(self,data,optimizer, batch_iter):
         """
@@ -318,6 +351,13 @@ class A_llmrec_model(nn.Module):
             text_rc_loss += text_reconstruction_loss.item()
             
         print("loss in epoch {}/{} iteration {}/{}: {} / BPR loss: {} / Matching loss: {} / Item reconstruction: {} / Text reconstruction: {}".format(epoch, total_epoch, step, total_step, mean_loss/iterss, bpr_loss/iterss, gt_loss/iterss, rc_loss/iterss, text_rc_loss/iterss))
+        return {
+            "loss": mean_loss / iterss,
+            "bpr_loss": bpr_loss / iterss,
+            "matching_loss": gt_loss / iterss,
+            "item_reconstruction_loss": rc_loss / iterss,
+            "text_reconstruction_loss": text_rc_loss / iterss,
+        }
     
     def make_interact_text(self, interact_ids, interact_max_num, use_images=False):
         """
@@ -401,6 +441,18 @@ class A_llmrec_model(nn.Module):
         self.llm.eval()
 
         use_images = (self.args.llm == 'smolvlm')
+        # region agent log
+        self._debug_log(
+            "H4",
+            "models/a_llmrec_model.py:425",
+            "phase2_start",
+            {
+                "llm": self.args.llm,
+                "use_images": bool(use_images),
+                "batch_size": int(len(u)),
+            },
+        )
+        # endregion
 
         # Get CF user representations for the batch (frozen CF-RecSys).
         with torch.no_grad():
@@ -451,7 +503,22 @@ class A_llmrec_model(nn.Module):
             # Must match the number of <image> tokens emitted by make_interact_text.
             if use_images:
                 n_images = min(5, len(interact_ids[-10:]))
-                images_batch.append(self.load_history_images(interact_ids, n=n_images))
+                sample_images = self.load_history_images(interact_ids, n=n_images)
+                images_batch.append(sample_images)
+                # region agent log
+                self._debug_log(
+                    "H1_H2",
+                    "models/a_llmrec_model.py:478",
+                    "sample_prompt_image_alignment",
+                    {
+                        "sample_idx": int(i),
+                        "history_len": int(len(interact_ids)),
+                        "requested_n_images": int(n_images),
+                        "loaded_images_len": int(len(sample_images)),
+                        "image_token_count": int(text_input[-1].count("<image>")),
+                    },
+                )
+                # endregion
 
         samples = {
             'text_input': text_input,
@@ -460,6 +527,20 @@ class A_llmrec_model(nn.Module):
             'candidate': candidate_embs,
             'images': images_batch if use_images else None,
         }
+        if use_images:
+            inner_lengths = [len(x) if isinstance(x, list) else -1 for x in images_batch]
+            # region agent log
+            self._debug_log(
+                "H1_H5",
+                "models/a_llmrec_model.py:493",
+                "phase2_images_batch_summary",
+                {
+                    "outer_images_batch_len": int(len(images_batch)),
+                    "inner_lengths_first5": inner_lengths[:5],
+                    "empty_inner_count": int(sum(1 for v in inner_lengths if v == 0)),
+                },
+            )
+            # endregion
         # Project CF user representations into LLM token space.
         log_emb = self.log_emb_proj(log_emb)
         loss_rm = self.llm(log_emb, samples)
@@ -467,6 +548,7 @@ class A_llmrec_model(nn.Module):
         optimizer.step()
         mean_loss += loss_rm.item()
         print("A-LLMRec model loss in epoch {}/{} iteration {}/{}: {}".format(epoch, total_epoch, step, total_step, mean_loss))
+        return {"loss": mean_loss}
         
     def generate(self, data):
         """
@@ -482,6 +564,19 @@ class A_llmrec_model(nn.Module):
         u, seq, pos, neg, rank = data
 
         use_images = (self.args.llm == 'smolvlm')
+        # region agent log
+        self._debug_log(
+            "G1",
+            "models/a_llmrec_model.py:549",
+            "generate_start",
+            {
+                "llm": self.args.llm,
+                "use_images": bool(use_images),
+                "batch_size": int(len(u)),
+            },
+            run_id="pre-fix",
+        )
+        # endregion
 
         answer = []
         text_input = []
@@ -531,6 +626,20 @@ class A_llmrec_model(nn.Module):
                 if use_images:
                     n_images = min(5, len(interact_ids[-10:]))
                     images_batch.append(self.load_history_images(interact_ids, n=n_images))
+                    # region agent log
+                    self._debug_log(
+                        "G2",
+                        "models/a_llmrec_model.py:604",
+                        "generate_sample_prompt_image_alignment",
+                        {
+                            "sample_idx": int(i),
+                            "history_len": int(len(interact_ids)),
+                            "n_images": int(n_images),
+                            "image_token_count": int(text_input[-1].count("<image>")),
+                        },
+                        run_id="pre-fix",
+                    )
+                    # endregion
 
         # Add user representation token at the beginning of the LLM input.
         log_emb = self.log_emb_proj(log_emb)
@@ -605,16 +714,49 @@ class A_llmrec_model(nn.Module):
                     length_penalty=1,
                     num_return_sequences=1,
                 )
+            # region agent log
+            self._debug_log(
+                "G3_G4",
+                "models/a_llmrec_model.py:680",
+                "generate_tensor_lengths",
+                {
+                    "input_prompt_tokens": int(input_ids_for_model.shape[1]),
+                    "output_total_tokens": int(outputs.shape[1]),
+                    "new_tokens_estimate": int(outputs.shape[1] - input_ids_for_model.shape[1]),
+                    "max_new_tokens": 50,
+                },
+                run_id="pre-fix",
+            )
+            # endregion
 
             outputs[outputs == 0] = 2 # convert output id 0 to 2 (eos_token_id)
             output_text = self.llm.llm_tokenizer.batch_decode(outputs, skip_special_tokens=True)
             output_text = [text.strip() for text in output_text]
+            only_new_tokens = outputs[:, input_ids_for_model.shape[1]:]
+            output_text_new_only = self.llm.llm_tokenizer.batch_decode(only_new_tokens, skip_special_tokens=True)
+            output_text_new_only = [text.strip() for text in output_text_new_only]
+            # region agent log
+            self._debug_log(
+                "G3_G5",
+                "models/a_llmrec_model.py:694",
+                "decode_preview_full_vs_new_only",
+                {
+                    "full_preview": output_text[0][:180] if len(output_text) > 0 else "",
+                    "new_only_preview": output_text_new_only[0][:180] if len(output_text_new_only) > 0 else "",
+                },
+                run_id="pre-fix",
+            )
+            # endregion
 
-        for i in range(len(text_input)):
-            f = open(f'/home/kavach/Dev/idea-3/A-LLMRec-Forked/results/smol/recommendation_output_smol_v1_2B.txt','a')
-            f.write('Answer: ' + str(answer[i]) + '\n\n')
-            f.write('LLM: ' + str(output_text[i]) + '\n\n')
-            f.write('--------------------------------\n\n')
-            f.close()
+        output_path = self.args.inference_output_file
+        output_dir = os.path.dirname(output_path)
+        if output_dir:
+            os.makedirs(output_dir, exist_ok=True)
 
-        return output_text
+        with open(output_path, 'a') as f:
+            for i in range(len(text_input)):
+                f.write('Answer: ' + str(answer[i]) + '\n\n')
+                f.write('LLM: ' + str(output_text_new_only[i]) + '\n\n')
+                f.write('--------------------------------\n\n')
+
+        return output_text_new_only
