@@ -63,7 +63,7 @@ class llm4rec(nn.Module):
             # for A-LLMRec's prompt assembly and embedding injection.
             # bos=<|im_start|>, eos/pad=<|im_end|>, unk=<|endoftext|> are
             # already correctly defined — do NOT override them.
-            _processor = AutoProcessor.from_pretrained("HuggingFaceTB/SmolVLM-Instruct")
+            _processor = AutoProcessor.from_pretrained("HuggingFaceTB/SmolVLM2-2.2B-Instruct")
             self.llm_tokenizer = _processor.tokenizer
 
         else:
