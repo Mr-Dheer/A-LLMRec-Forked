@@ -27,13 +27,18 @@ if __name__ == "__main__":
     parser.add_argument("--inference", action='store_true')
     
     # hyperparameters options
-    parser.add_argument('--batch_size1', default=32, type=int)
-    parser.add_argument('--batch_size2', default=1, type=int)
-    parser.add_argument('--batch_size_infer', default=4, type=int)
+    parser.add_argument('--batch_size1', default=128, type=int)
+    parser.add_argument('--batch_size2', default=8, type=int)
+    parser.add_argument('--batch_size_infer', default=16, type=int)
     parser.add_argument('--maxlen', default=50, type=int)
     parser.add_argument('--num_epochs', default=10, type=int)
     parser.add_argument("--stage1_lr", type=float, default=0.0001)
     parser.add_argument("--stage2_lr", type=float, default=0.0001)
+
+    # Weights & Biases options
+    parser.add_argument("--wandb", action='store_true', help='Enable Weights & Biases logging')
+    parser.add_argument("--wandb_project", type=str, default='A-LLMRec', help='W&B project name')
+    parser.add_argument("--wandb_run_name", type=str, default=None, help='W&B run name')
     
     args = parser.parse_args()
     

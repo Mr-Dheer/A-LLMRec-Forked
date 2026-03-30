@@ -186,9 +186,9 @@ class A_llmrec_model(nn.Module):
           - mode='generate': inference / text generation
         """
         if mode == 'phase1':
-            self.pre_train_phase1(data, optimizer, batch_iter)
+            return self.pre_train_phase1(data, optimizer, batch_iter)
         if mode == 'phase2':
-            self.pre_train_phase2(data, optimizer, batch_iter)
+            return self.pre_train_phase2(data, optimizer, batch_iter)
         if mode =='generate':
             self.generate(data)
 
@@ -284,6 +284,13 @@ class A_llmrec_model(nn.Module):
             text_rc_loss += text_reconstruction_loss.item()
             
         print("loss in epoch {}/{} iteration {}/{}: {} / BPR loss: {} / Matching loss: {} / Item reconstruction: {} / Text reconstruction: {}".format(epoch, total_epoch, step, total_step, mean_loss/iterss, bpr_loss/iterss, gt_loss/iterss, rc_loss/iterss, text_rc_loss/iterss))
+        return {
+            "loss": mean_loss / iterss,
+            "bpr_loss": bpr_loss / iterss,
+            "matching_loss": gt_loss / iterss,
+            "item_reconstruction_loss": rc_loss / iterss,
+            "text_reconstruction_loss": text_rc_loss / iterss,
+        }
     
     def make_interact_text(self, interact_ids, interact_max_num):
         """
@@ -404,6 +411,7 @@ class A_llmrec_model(nn.Module):
         optimizer.step()
         mean_loss += loss_rm.item()
         print("A-LLMRec model loss in epoch {}/{} iteration {}/{}: {}".format(epoch, total_epoch, step, total_step, mean_loss))
+        return {"loss": mean_loss}
         
     def generate(self, data):
         """
@@ -502,7 +510,7 @@ class A_llmrec_model(nn.Module):
             output_text = [text.strip() for text in output_text]
 
         for i in range(len(text_input)):
-            f = open(f'/home/kavach/Dev/idea-3/A-LLMRec-Forked/results/smol/recommendation_output_smol_v1_2B.txt','a')
+            f = open(f'./results/smol/recommendation_output_smol_v1_2B_lux_beauty.txt','a')
             # f.write(text_input[i])
             # f.write('\n\n')
             

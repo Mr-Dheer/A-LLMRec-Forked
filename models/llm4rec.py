@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 
 from transformers import (
-    AutoModelForVision2Seq,
+    AutoModelForImageTextToText,
     AutoProcessor,
     AutoTokenizer,
     BitsAndBytesConfig,
@@ -53,11 +53,11 @@ class llm4rec(nn.Module):
             self.llm_tokenizer.add_special_tokens({'unk_token': '</s>'})
 
         elif llm_model == "smolvlm":
-            self.llm_model = AutoModelForVision2Seq.from_pretrained(
-                "HuggingFaceTB/SmolVLM-Instruct",
-                torch_dtype=torch.bfloat16,
+            self.llm_model = AutoModelForImageTextToText.from_pretrained(
+                "HuggingFaceTB/SmolVLM2-2.2B-Instruct",
+                dtype=torch.bfloat16,
                 _attn_implementation="flash_attention_2" if torch.cuda.is_available() else "eager",
-                device_map="auto",
+                device_map="cuda:0",
             )
             # SmolVLM uses Idefics3Processor; we only need the text tokenizer
             # for A-LLMRec's prompt assembly and embedding injection.
