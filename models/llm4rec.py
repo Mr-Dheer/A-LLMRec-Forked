@@ -5,7 +5,6 @@ import time
 import uuid
 
 from transformers import (
-    AutoModelForVision2Seq,
     AutoProcessor,
     AutoTokenizer,
     BitsAndBytesConfig,
