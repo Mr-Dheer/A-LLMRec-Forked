@@ -103,9 +103,25 @@ class A_llmrec_model(nn.Module):
 
             # candidate_num matches make_candidate_text (1 positive + 19 negatives).
             self.candidate_num = 20
-            # Scoring is done via dot-product between the LLM hidden state and each
-            # candidate's embedding — no separate linear head needed.
             self.ce_criterion = nn.CrossEntropyLoss()
+
+            # score_head projects last_hidden (d_model=4096) DOWN into the
+            # Stage 1 128-d CF-text space for scoring.
+            #
+            # Previously, scoring was:
+            #   cosine(last_hidden[4096], item_emb_proj(e_i)[4096])
+            # which tried to lift CF embeddings UP into OPT's text-semantic space.
+            # On Luxury_Beauty this failed because OPT's luxury brand knowledge
+            # dominated last_hidden, leaving no room for CF alignment.
+            #
+            # New scoring:
+            #   cosine(score_head(last_hidden)[128], e_i[128])
+            # We project last_hidden DOWN into the Stage 1 joint CF-text space,
+            # which was explicitly trained to encode both CF and text signals.
+            # item_emb_proj is now used ONLY for injecting into the LLM prompt.
+            d_model = self.llm.llm_model.config.hidden_size
+            self.score_head = nn.Linear(d_model, 128)
+            nn.init.xavier_normal_(self.score_head.weight)
             
     def save_model(self, args, epoch1=None, epoch2=None):
         out_dir = f'./models/saved_models/'
@@ -122,6 +138,9 @@ class A_llmrec_model(nn.Module):
         if args.pretrain_stage2:
             torch.save(self.log_emb_proj.state_dict(), out_dir + 'log_proj.pt')
             torch.save(self.item_emb_proj.state_dict(), out_dir + 'item_proj.pt')
+            # Save score_head if ID-prediction mode is active.
+            if args.id_prediction:
+                torch.save(self.score_head.state_dict(), out_dir + 'score_head.pt')
             
     def load_model(self, args, phase1_epoch=None, phase2_epoch=None):
         out_dir = f'./models/saved_models/{args.rec_pre_trained_data}_{args.recsys}_{phase1_epoch}_'
@@ -135,14 +154,20 @@ class A_llmrec_model(nn.Module):
 
         if args.inference:
             out_dir += f'{args.llm}_{phase2_epoch}_'
-            
-            log_emb_proj_dict = torch.load(out_dir + 'log_proj.pt', map_location = args.device)
+
+            log_emb_proj_dict = torch.load(out_dir + 'log_proj.pt', map_location=args.device)
             self.log_emb_proj.load_state_dict(log_emb_proj_dict)
             del log_emb_proj_dict
-            
-            item_emb_proj_dict = torch.load(out_dir + 'item_proj.pt', map_location = args.device)
+
+            item_emb_proj_dict = torch.load(out_dir + 'item_proj.pt', map_location=args.device)
             self.item_emb_proj.load_state_dict(item_emb_proj_dict)
             del item_emb_proj_dict
+
+            # Load score_head for ID-prediction inference.
+            if args.id_prediction:
+                score_head_dict = torch.load(out_dir + 'score_head.pt', map_location=args.device)
+                self.score_head.load_state_dict(score_head_dict)
+                del score_head_dict
 
 
     def find_item_text(self, item, title_flag=True, description_flag=True):
@@ -188,14 +213,17 @@ class A_llmrec_model(nn.Module):
         
         return item_embs
     
-    def forward(self, data, optimizer=None, batch_iter=None, mode='phase1'):
+    def forward(self, data, optimizer=None, batch_iter=None, mode='phase1', **kwargs):
         """
         Dispatch to the corresponding pipeline:
-          - mode='phase1':     Stage 1 alignment training (SBERT + autoencoder)
-          - mode='phase2':     Stage 2 text-generation training (original)
-          - mode='generate':   Inference via text generation (original)
-          - mode='phase2_id':  Stage 2 ID-prediction training (new)
-          - mode='generate_id': Inference via ID prediction (new)
+          - mode='phase1':      Stage 1 alignment training (SBERT + autoencoder)
+          - mode='phase2':      Stage 2 text-generation training (original)
+          - mode='generate':    Inference via text generation (original)
+          - mode='phase2_id':   Stage 2 ID-prediction training
+          - mode='generate_id': Inference via ID prediction
+
+        kwargs are forwarded to generate_id (e.g. use_user_token=True for the
+        [UserRep] token ablation — see PLAN.md Experiment 9).
         """
         if mode == 'phase1':
             self.pre_train_phase1(data, optimizer, batch_iter)
@@ -206,7 +234,7 @@ class A_llmrec_model(nn.Module):
         if mode == 'phase2_id':
             self.pre_train_phase2_id(data, optimizer, batch_iter)
         if mode == 'generate_id':
-            return self.generate_id(data)
+            return self.generate_id(data, **kwargs)
 
     def pre_train_phase1(self,data,optimizer, batch_iter):
         """
@@ -595,31 +623,58 @@ class A_llmrec_model(nn.Module):
 
         return text_input, interact_embs, candidate_embs, candidate_ids_list, target_indices
 
+    def _get_scoring_embs(self, candidate_ids_list):
+        """
+        Retrieve the raw 128-d Stage 1 CF-text embeddings for each candidate set.
+
+        These are used as scoring targets in the new ID-prediction approach.
+        Unlike candidate_embs (which go through item_emb_proj to 4096-d for
+        LLM injection), these stay in the 128-d Stage 1 space where scoring
+        is performed.
+
+        Returns a list of tensors, one per user: (candidate_num, 128)
+        """
+        scoring_embs = []
+        for candidate_ids in candidate_ids_list:
+            embs = self.recsys.model.item_emb(
+                torch.LongTensor(candidate_ids).to(self.device)
+            )
+            # Pass through the frozen Stage 1 MLP encoder to get 128-d joint
+            # CF-text embeddings. mlp is frozen after Stage 1 training.
+            with torch.no_grad():
+                embs_128, _ = self.mlp(embs)
+            scoring_embs.append(embs_128)
+        return scoring_embs
+
     def pre_train_phase2_id(self, data, optimizer, batch_iter):
         """
-        Stage 2 ID-prediction training (AlmostRec-style).
+        Stage 2 ID-prediction training.
 
-        Instead of training the LLM to generate the next item's title,
-        we:
-          1. Run the same enriched prompt through the frozen LLM.
-          2. Take the last token's hidden state.
-          3. Apply a small learned linear head to get one logit per candidate.
-          4. Optimise with cross-entropy: ground-truth = position of the
-             positive item in the shuffled candidate list.
+        Key change from id-pred-1:
+          OLD: cosine(last_hidden[4096], item_emb_proj(e_i)[4096])
+               → tried to lift CF embeddings UP into OPT's text space
+               → failed on Luxury_Beauty because OPT's luxury brand knowledge
+                 dominated last_hidden, leaving no room for CF alignment
 
-        Only `log_emb_proj`, `item_emb_proj`, and `id_pred_head` receive
-        gradient updates; the LLM stays completely frozen.
+          NEW: cosine(score_head(last_hidden)[128], e_i[128])
+               → projects last_hidden DOWN into Stage 1's 128-d CF-text space
+               → Stage 1 space explicitly encodes both CF and text signals
+               → score_head is the only new trainable parameter
+
+        Trainable parameters:
+          - log_emb_proj  : user rep injection into LLM (unchanged)
+          - item_emb_proj : item emb injection into LLM (unchanged, no longer scores)
+          - score_head    : linear 4096→128, bridges LLM output to Stage 1 space
         """
         epoch, total_epoch, step, total_step = batch_iter
 
         optimizer.zero_grad()
         u, seq, pos, neg = data
 
-        # Get CF user representations (frozen CF-RecSys).
         with torch.no_grad():
             log_emb = self.recsys.model(u, seq, pos, neg, mode='log_only')
 
-        text_input, interact_embs, candidate_embs, _, target_indices = \
+        text_input, interact_embs, candidate_embs, candidate_ids_list, target_indices = \
             self._build_id_samples(u, seq, pos)
 
         samples = {
@@ -628,21 +683,21 @@ class A_llmrec_model(nn.Module):
             'candidate': candidate_embs,
         }
 
-        # Project user representations into the LLM token space.
         log_emb = self.log_emb_proj(log_emb)
 
-        # Run the frozen LLM and get the last token's hidden state.
+        # Run frozen LLM, get hidden state (last token by default).
         last_hidden = self.llm.forward_id(log_emb, samples)   # (batch, d_model)
 
-        # Dot-product scoring: score_k = last_hidden · candidate_embs[k].
-        # Both vectors are L2-normalised first (cosine similarity) so that
-        # scores are bounded in [-1, 1] and the loss stays stable.
-        # Without normalisation, unconstrained magnitudes cause the dot products
-        # to explode → alternating 0.0 and 30+ losses (gradient explosion).
-        cand_stack = torch.stack([c for c in candidate_embs])  # (batch, candidate_num, d_model)
-        h_norm = F.normalize(last_hidden, dim=-1)               # (batch, d_model)
-        c_norm = F.normalize(cand_stack, dim=-1)                # (batch, candidate_num, d_model)
-        logits = torch.bmm(c_norm, h_norm.unsqueeze(-1)).squeeze(-1)  # (batch, candidate_num)
+        # Project last_hidden DOWN to 128-d Stage 1 CF-text space.
+        h_128 = self.score_head(last_hidden)                   # (batch, 128)
+
+        # Scoring targets: raw 128-d Stage 1 embeddings (NOT item_emb_proj output).
+        scoring_embs = self._get_scoring_embs(candidate_ids_list)  # list of (20, 128)
+        cand_stack = torch.stack(scoring_embs)                 # (batch, 20, 128)
+
+        h_norm = F.normalize(h_128, dim=-1)                    # (batch, 128)
+        c_norm = F.normalize(cand_stack, dim=-1)               # (batch, 20, 128)
+        logits = torch.bmm(c_norm, h_norm.unsqueeze(-1)).squeeze(-1)  # (batch, 20)
 
         target_tensor = torch.tensor(target_indices, dtype=torch.long, device=self.device)
         loss = self.ce_criterion(logits, target_tensor)
@@ -650,19 +705,22 @@ class A_llmrec_model(nn.Module):
         loss.backward()
         optimizer.step()
 
-        print("A-LLMRec (ID-pred) loss in epoch {}/{} iteration {}/{}: {:.4f}".format(
+        print("A-LLMRec (ID-pred v2) loss in epoch {}/{} iteration {}/{}: {:.4f}".format(
             epoch, total_epoch, step, total_step, loss.item()
         ))
 
-    def generate_id(self, data):
+    def generate_id(self, data, use_user_token=False):
         """
-        Inference using the ID prediction head.
+        Inference using the score_head in Stage 1 128-d space.
 
-        Returns a list of (predicted_item_id, candidate_ids, target_item_id)
-        tuples and also writes results to recommendation_output_id.txt.
+        Args:
+          use_user_token : if True, score using the [UserRep] token's hidden
+                           state (position 0) instead of the last token.
+                           Pass True to run the ablation from PLAN.md Exp 9.
 
-        Metrics (Hit@1) can be computed directly from the returned values
-        without any string matching.
+        Returns a list of result dicts with keys:
+          predicted_id, target_id, candidate_ids, hit
+        Also appends to recommendation_output_id.txt.
         """
         u, seq, pos, neg, rank = data
 
@@ -682,13 +740,22 @@ class A_llmrec_model(nn.Module):
         }
 
         with torch.no_grad():
-            last_hidden = self.llm.forward_id(log_emb, samples)  # (batch, d_model)
-            # Dot-product scoring with L2 normalisation (cosine similarity).
-            cand_stack = torch.stack([c for c in candidate_embs])  # (batch, candidate_num, d_model)
-            h_norm = F.normalize(last_hidden, dim=-1)               # (batch, d_model)
-            c_norm = F.normalize(cand_stack, dim=-1)                # (batch, candidate_num, d_model)
-            logits = torch.bmm(c_norm, h_norm.unsqueeze(-1)).squeeze(-1)  # (batch, candidate_num)
-            pred_indices = logits.argmax(dim=-1).cpu().numpy()    # (batch,)
+            # Get hidden state from frozen LLM.
+            last_hidden = self.llm.forward_id(
+                log_emb, samples, use_user_token=use_user_token
+            )                                                       # (batch, d_model)
+
+            # Project DOWN to 128-d Stage 1 CF-text space.
+            h_128 = self.score_head(last_hidden)                    # (batch, 128)
+
+            # Scoring targets: raw 128-d Stage 1 embeddings.
+            scoring_embs = self._get_scoring_embs(candidate_ids_list)
+            cand_stack = torch.stack(scoring_embs)                  # (batch, 20, 128)
+
+            h_norm = F.normalize(h_128, dim=-1)                     # (batch, 128)
+            c_norm = F.normalize(cand_stack, dim=-1)                # (batch, 20, 128)
+            logits = torch.bmm(c_norm, h_norm.unsqueeze(-1)).squeeze(-1)  # (batch, 20)
+            pred_indices = logits.argmax(dim=-1).cpu().numpy()      # (batch,)
 
         with open('./recommendation_output_id.txt', 'a') as f:
             for i in range(len(u)):

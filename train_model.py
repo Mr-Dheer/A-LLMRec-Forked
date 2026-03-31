@@ -322,10 +322,15 @@ def inference_id_(rank, world_size, args):
     for _, data in enumerate(inference_data_loader):
         u, seq, pos, neg = data
         u, seq, pos, neg = u.numpy(), seq.numpy(), pos.numpy(), neg.numpy()
-        batch_results = model([u, seq, pos, neg, rank], mode='generate_id')
+        batch_results = model(
+            [u, seq, pos, neg, rank],
+            mode='generate_id',
+            use_user_token=args.use_user_token,
+        )
         if batch_results:
             total_hit += sum(r['hit'] for r in batch_results)
             total_count += len(batch_results)
 
     if total_count > 0:
-        print(f"ID-prediction Hit@1: {total_hit / total_count:.4f}  ({total_hit}/{total_count})")
+        token_desc = "[UserRep] token" if args.use_user_token else "last token"
+        print(f"ID-prediction Hit@1 ({token_desc}): {total_hit / total_count:.4f}  ({total_hit}/{total_count})")

@@ -34,11 +34,15 @@ if __name__ == "__main__":
     # ID-prediction mode: replaces text-generation objective with item-ID CE loss.
     parser.add_argument("--id_prediction", action='store_true',
                         help="Use ID-prediction head instead of text-generation for Stage 2.")
+    # Ablation: score using [UserRep] token hidden state (position 0) instead
+    # of the last token. See PLAN.md Experiment 9.
+    parser.add_argument("--use_user_token", action='store_true',
+                        help="Score using [UserRep] token hidden state instead of last token.")
     
     # hyperparameters options
-    parser.add_argument('--batch_size1', default=32, type=int)
-    parser.add_argument('--batch_size2', default=1, type=int)
-    parser.add_argument('--batch_size_infer', default=4, type=int)
+    parser.add_argument('--batch_size1', default=128, type=int)
+    parser.add_argument('--batch_size2', default=64, type=int)
+    parser.add_argument('--batch_size_infer', default=16, type=int)
     parser.add_argument('--maxlen', default=50, type=int)
     parser.add_argument('--num_epochs', default=10, type=int)
     parser.add_argument("--stage1_lr", type=float, default=0.0001)
