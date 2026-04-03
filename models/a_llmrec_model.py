@@ -1,9 +1,6 @@
 import os
 import random
 import pickle
-import json
-import time
-import uuid
 
 import torch
 from torch.cuda.amp import autocast as autocast
@@ -62,6 +59,7 @@ class A_llmrec_model(nn.Module):
         else:
             self.id_to_asin = {}
         self.image_dir = f'./data/images/{args.rec_pre_trained_data}'
+        self._image_cache = self._preload_images()
 
         self.recsys = RecSys(args.recsys, rec_pre_trained_data, self.device)
         self.item_num = self.recsys.item_num
@@ -191,45 +189,37 @@ class A_llmrec_model(nn.Module):
         elif not title_flag and description_flag:
             return f'"{self.text_name_dict[d].get(item,d_)}"'
         
+    def _preload_images(self):
+        """Pre-load all product images into memory to avoid repeated disk I/O."""
+        cache = {}
+        if not self.id_to_asin or not os.path.isdir(self.image_dir):
+            return cache
+        for int_id, asin in self.id_to_asin.items():
+            path = os.path.join(self.image_dir, f'{asin}.jpg')
+            try:
+                cache[int(int_id)] = Image.open(path).convert('RGB')
+            except Exception:
+                pass
+        print(f'Pre-loaded {len(cache)} / {len(self.id_to_asin)} product images into memory')
+        return cache
+
     def load_history_images(self, item_ids, n=5):
         """
         Load the last n product images for the given item_ids sequence.
 
-        Maps each integer item_id to its ASIN via self.id_to_asin, then loads
-        the corresponding JPEG from self.image_dir.  If the image file is
-        missing or corrupt, a 100×100 black RGB image is used as a fallback.
+        Looks up images from the in-memory cache (populated at init).
+        Falls back to a 100x100 black image for missing items.
         The returned list always contains exactly n PIL Images (padded at the
         front with black images if the history is shorter than n).
         """
         black = Image.fromarray(np.zeros((100, 100, 3), dtype=np.uint8))
         images = []
         for item_id in list(item_ids)[-n:]:
-            asin = self.id_to_asin.get(int(item_id))
-            path = os.path.join(self.image_dir, f'{asin}.jpg') if asin else None
-            try:
-                img = Image.open(path).convert('RGB') if (path and os.path.exists(path)) else black
-            except Exception:
-                img = black
+            img = self._image_cache.get(int(item_id), black)
             images.append(img)
         while len(images) < n:
             images.insert(0, black)
         return images
-
-    def _debug_log(self, hypothesis_id, location, message, data, run_id="pre-fix"):
-        payload = {
-            "id": f"log_{int(time.time() * 1000)}_{uuid.uuid4().hex[:8]}",
-            "timestamp": int(time.time() * 1000),
-            "runId": run_id,
-            "hypothesisId": hypothesis_id,
-            "location": location,
-            "message": message,
-            "data": data,
-        }
-        try:
-            with open("/users/kavach_d/projects/idea-3/.cursor/debug.log", "a", encoding="utf-8") as f:
-                f.write(json.dumps(payload, ensure_ascii=True) + "\n")
-        except Exception:
-            pass
 
     def get_item_emb(self, item_ids):
         """
@@ -438,21 +428,9 @@ class A_llmrec_model(nn.Module):
         interact_embs = []
         candidate_embs = []
         images_batch = []
-        self.llm.eval()
+        self.llm.train()
 
         use_images = (self.args.llm == 'smolvlm')
-        # region agent log
-        self._debug_log(
-            "H4",
-            "models/a_llmrec_model.py:425",
-            "phase2_start",
-            {
-                "llm": self.args.llm,
-                "use_images": bool(use_images),
-                "batch_size": int(len(u)),
-            },
-        )
-        # endregion
 
         # Get CF user representations for the batch (frozen CF-RecSys).
         with torch.no_grad():
@@ -505,20 +483,6 @@ class A_llmrec_model(nn.Module):
                 n_images = min(5, len(interact_ids[-10:]))
                 sample_images = self.load_history_images(interact_ids, n=n_images)
                 images_batch.append(sample_images)
-                # region agent log
-                self._debug_log(
-                    "H1_H2",
-                    "models/a_llmrec_model.py:478",
-                    "sample_prompt_image_alignment",
-                    {
-                        "sample_idx": int(i),
-                        "history_len": int(len(interact_ids)),
-                        "requested_n_images": int(n_images),
-                        "loaded_images_len": int(len(sample_images)),
-                        "image_token_count": int(text_input[-1].count("<image>")),
-                    },
-                )
-                # endregion
 
         samples = {
             'text_input': text_input,
@@ -527,20 +491,6 @@ class A_llmrec_model(nn.Module):
             'candidate': candidate_embs,
             'images': images_batch if use_images else None,
         }
-        if use_images:
-            inner_lengths = [len(x) if isinstance(x, list) else -1 for x in images_batch]
-            # region agent log
-            self._debug_log(
-                "H1_H5",
-                "models/a_llmrec_model.py:493",
-                "phase2_images_batch_summary",
-                {
-                    "outer_images_batch_len": int(len(images_batch)),
-                    "inner_lengths_first5": inner_lengths[:5],
-                    "empty_inner_count": int(sum(1 for v in inner_lengths if v == 0)),
-                },
-            )
-            # endregion
         # Project CF user representations into LLM token space.
         log_emb = self.log_emb_proj(log_emb)
         loss_rm = self.llm(log_emb, samples)
@@ -564,19 +514,6 @@ class A_llmrec_model(nn.Module):
         u, seq, pos, neg, rank = data
 
         use_images = (self.args.llm == 'smolvlm')
-        # region agent log
-        self._debug_log(
-            "G1",
-            "models/a_llmrec_model.py:549",
-            "generate_start",
-            {
-                "llm": self.args.llm,
-                "use_images": bool(use_images),
-                "batch_size": int(len(u)),
-            },
-            run_id="pre-fix",
-        )
-        # endregion
 
         answer = []
         text_input = []
@@ -626,20 +563,6 @@ class A_llmrec_model(nn.Module):
                 if use_images:
                     n_images = min(5, len(interact_ids[-10:]))
                     images_batch.append(self.load_history_images(interact_ids, n=n_images))
-                    # region agent log
-                    self._debug_log(
-                        "G2",
-                        "models/a_llmrec_model.py:604",
-                        "generate_sample_prompt_image_alignment",
-                        {
-                            "sample_idx": int(i),
-                            "history_len": int(len(interact_ids)),
-                            "n_images": int(n_images),
-                            "image_token_count": int(text_input[-1].count("<image>")),
-                        },
-                        run_id="pre-fix",
-                    )
-                    # endregion
 
         # Add user representation token at the beginning of the LLM input.
         log_emb = self.log_emb_proj(log_emb)
@@ -671,7 +594,7 @@ class A_llmrec_model(nn.Module):
                 pixel_values = None
                 image_attention_mask = None
 
-            with torch.cuda.amp.autocast():
+            with torch.amp.autocast('cuda', dtype=torch.bfloat16):
                 inputs_embeds = self.llm.llm_model.get_input_embeddings()(llm_tokens.input_ids)
 
                 # Replace [HistoryEmb] / [CandidateEmb] token positions with
@@ -696,57 +619,82 @@ class A_llmrec_model(nn.Module):
                 else:
                     input_ids_for_model = llm_tokens.input_ids
 
-                outputs = self.llm.llm_model.generate(
-                    input_ids=input_ids_for_model,
-                    inputs_embeds=inputs_embeds,
-                    attention_mask=attention_mask,
-                    pixel_values=pixel_values,
-                    image_attention_mask=image_attention_mask,
-                    do_sample=False,
-                    top_p=0.9,
-                    temperature=1,
-                    num_beams=1,
-                    max_new_tokens=50,
-                    min_length=1,
-                    eos_token_id=self.llm.llm_tokenizer.eos_token_id,
-                    pad_token_id=self.llm.llm_tokenizer.eos_token_id,
-                    repetition_penalty=1.5,
-                    length_penalty=1,
-                    num_return_sequences=1,
-                )
-            # region agent log
-            self._debug_log(
-                "G3_G4",
-                "models/a_llmrec_model.py:680",
-                "generate_tensor_lengths",
-                {
-                    "input_prompt_tokens": int(input_ids_for_model.shape[1]),
-                    "output_total_tokens": int(outputs.shape[1]),
-                    "new_tokens_estimate": int(outputs.shape[1] - input_ids_for_model.shape[1]),
-                    "max_new_tokens": 50,
-                },
-                run_id="pre-fix",
-            )
-            # endregion
+                # Match inputs_embeds dtype to model dtype (see llm4rec.forward).
+                if pixel_values is not None:
+                    model_dtype = next(self.llm.llm_model.parameters()).dtype
+                    inputs_embeds = inputs_embeds.to(model_dtype)
 
-            outputs[outputs == 0] = 2 # convert output id 0 to 2 (eos_token_id)
-            output_text = self.llm.llm_tokenizer.batch_decode(outputs, skip_special_tokens=True)
-            output_text = [text.strip() for text in output_text]
-            only_new_tokens = outputs[:, input_ids_for_model.shape[1]:]
-            output_text_new_only = self.llm.llm_tokenizer.batch_decode(only_new_tokens, skip_special_tokens=True)
-            output_text_new_only = [text.strip() for text in output_text_new_only]
-            # region agent log
-            self._debug_log(
-                "G3_G5",
-                "models/a_llmrec_model.py:694",
-                "decode_preview_full_vs_new_only",
-                {
-                    "full_preview": output_text[0][:180] if len(output_text) > 0 else "",
-                    "new_only_preview": output_text_new_only[0][:180] if len(output_text_new_only) > 0 else "",
-                },
-                run_id="pre-fix",
-            )
-            # endregion
+                if use_images:
+                    # SmolVLM + images path: model.generate() internally calls
+                    # prepare_inputs_for_generation which sets input_ids=None
+                    # whenever inputs_embeds is provided.  inputs_merger then
+                    # falls back to an embedding-comparison heuristic that gives
+                    # wrong image-token counts, raising "not divisible by
+                    # patch_size".
+                    #
+                    # Fix: run the first forward pass manually (input_ids stays
+                    # intact → inputs_merger uses the correct branch), then
+                    # decode greedily from the KV cache without inputs_embeds.
+                    first_out = self.llm.llm_model(
+                        input_ids=input_ids_for_model,
+                        inputs_embeds=inputs_embeds,
+                        attention_mask=attention_mask,
+                        pixel_values=pixel_values,
+                        image_attention_mask=image_attention_mask,
+                        use_cache=True,
+                        return_dict=True,
+                    )
+                    past_kv = first_out.past_key_values
+                    next_tok = first_out.logits[:, -1, :].argmax(dim=-1, keepdim=True)
+                    all_new = [next_tok]
+                    cur_attn = torch.cat(
+                        [attention_mask, torch.ones((attention_mask.size(0), 1), dtype=torch.long, device=self.device)],
+                        dim=1,
+                    )
+                    for _ in range(49):  # max_new_tokens - 1
+                        if (next_tok == self.llm.llm_tokenizer.eos_token_id).all():
+                            break
+                        step_out = self.llm.llm_model(
+                            input_ids=next_tok,
+                            attention_mask=cur_attn,
+                            past_key_values=past_kv,
+                            use_cache=True,
+                            return_dict=True,
+                        )
+                        past_kv = step_out.past_key_values
+                        next_tok = step_out.logits[:, -1, :].argmax(dim=-1, keepdim=True)
+                        all_new.append(next_tok)
+                        cur_attn = torch.cat(
+                            [cur_attn, torch.ones((cur_attn.size(0), 1), dtype=torch.long, device=self.device)],
+                            dim=1,
+                        )
+                    outputs = torch.cat(all_new, dim=1)  # [batch, num_new_tokens]
+                    output_text_new_only = self.llm.llm_tokenizer.batch_decode(outputs, skip_special_tokens=True)
+                    output_text_new_only = [text.strip() for text in output_text_new_only]
+                else:
+                    outputs = self.llm.llm_model.generate(
+                        input_ids=input_ids_for_model,
+                        inputs_embeds=inputs_embeds,
+                        attention_mask=attention_mask,
+                        pixel_values=pixel_values,
+                        image_attention_mask=image_attention_mask,
+                        do_sample=False,
+                        num_beams=1,
+                        max_new_tokens=50,
+                        min_length=1,
+                        eos_token_id=self.llm.llm_tokenizer.eos_token_id,
+                        pad_token_id=self.llm.llm_tokenizer.eos_token_id,
+                        repetition_penalty=1.5,
+                        length_penalty=1,
+                        num_return_sequences=1,
+                    )
+                    # OPT uses token 0 as padding — remap to EOS (2) so
+                    # batch_decode works.
+                    if self.args.llm == 'opt':
+                        outputs[outputs == 0] = 2
+                    only_new_tokens = outputs[:, input_ids_for_model.shape[1]:]
+                    output_text_new_only = self.llm.llm_tokenizer.batch_decode(only_new_tokens, skip_special_tokens=True)
+                    output_text_new_only = [text.strip() for text in output_text_new_only]
 
         output_path = self.args.inference_output_file
         output_dir = os.path.dirname(output_path)
