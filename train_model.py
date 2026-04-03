@@ -4,7 +4,6 @@ import random
 import time
 import os
 
-import wandb
 from tqdm import tqdm
 
 import torch.multiprocessing as mp
@@ -73,9 +72,6 @@ def train_model_phase1_(rank, world_size, args):
         
     adam_optimizer = torch.optim.Adam(model.parameters(), lr=args.stage1_lr, betas=(0.9, 0.98))
     
-    if rank == 0 and args.wandb:
-        wandb.init(project=args.wandb_project, name=args.wandb_run_name, config=vars(args))
-
     epoch_start_idx = 1
     T = 0.0
     model.train()
@@ -87,8 +83,6 @@ def train_model_phase1_(rank, world_size, args):
             u, seq, pos, neg = data
             u, seq, pos, neg = u.numpy(), seq.numpy(), pos.numpy(), neg.numpy()
             loss_dict = model([u,seq,pos,neg], optimizer=adam_optimizer, batch_iter=[epoch,args.num_epochs + 1,step,num_batch], mode='phase1')
-            if rank == 0 and args.wandb and loss_dict is not None:
-                wandb.log({f"phase1/{k}": v for k, v in loss_dict.items()} | {"epoch": epoch, "step": step})
             if step % max(10,num_batch//100) ==0:
                 if rank ==0:
                     if args.multi_gpu: model.module.save_model(args, epoch1=epoch)
@@ -98,8 +92,6 @@ def train_model_phase1_(rank, world_size, args):
             else: model.save_model(args, epoch1=epoch)
 
     print('train time :', time.time() - t0)
-    if rank == 0 and args.wandb:
-        wandb.finish()
     if args.multi_gpu:
         destroy_process_group()
     return 
@@ -131,9 +123,6 @@ def train_model_phase2_(rank,world_size,args):
         train_data_loader = DataLoader(train_data_set, batch_size = args.batch_size2, pin_memory=True, shuffle=True)
     adam_optimizer = torch.optim.Adam(model.parameters(), lr=args.stage2_lr, betas=(0.9, 0.98))
     
-    if rank == 0 and args.wandb:
-        wandb.init(project=args.wandb_project, name=args.wandb_run_name, config=vars(args))
-
     epoch_start_idx = 1
     T = 0.0
     model.train()
@@ -145,8 +134,6 @@ def train_model_phase2_(rank,world_size,args):
             u, seq, pos, neg = data
             u, seq, pos, neg = u.numpy(), seq.numpy(), pos.numpy(), neg.numpy()
             loss_dict = model([u,seq,pos,neg], optimizer=adam_optimizer, batch_iter=[epoch,args.num_epochs + 1,step,num_batch], mode='phase2')
-            if rank == 0 and args.wandb and loss_dict is not None:
-                wandb.log({f"phase2/{k}": v for k, v in loss_dict.items()} | {"epoch": epoch, "step": step})
             if step % max(10,num_batch//100) ==0:
                 if rank ==0:
                     if args.multi_gpu: model.module.save_model(args, epoch1=phase1_epoch, epoch2=epoch)
@@ -156,8 +143,6 @@ def train_model_phase2_(rank,world_size,args):
             else: model.save_model(args, epoch1=phase1_epoch, epoch2=epoch)
 
     print('phase2 train time :', time.time() - t0)
-    if rank == 0 and args.wandb:
-        wandb.finish()
     if args.multi_gpu:
         destroy_process_group()
     return
