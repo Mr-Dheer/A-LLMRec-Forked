@@ -56,7 +56,7 @@ if __name__ == '__main__':
     epoch_start_idx = 1
     if args.state_dict_path is not None:
         try:
-            kwargs, checkpoint = torch.load(args.state_dict_path, map_location=torch.device(args.device))
+            kwargs, checkpoint = torch.load(args.state_dict_path, map_location=torch.device(args.device), weights_only=False)
             kwargs['args'].device = args.device
             model = SASRec(**kwargs).to(args.device)
             model.load_state_dict(checkpoint)
