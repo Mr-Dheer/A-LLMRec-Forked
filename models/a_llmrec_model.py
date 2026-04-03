@@ -510,7 +510,7 @@ class A_llmrec_model(nn.Module):
             output_text = [text.strip() for text in output_text]
 
         for i in range(len(text_input)):
-            f = open(f'./results/smol/recommendation_output_smol_v1_2B_lux_beauty.txt','a')
+            f = open(f'/users/kavach_d/projects/idea-3/A-LLMRec-Forked/results/smol/smol_2b_no_change_in_archi_just_swapped_llm.txt','a')
             # f.write(text_input[i])
             # f.write('\n\n')
             
