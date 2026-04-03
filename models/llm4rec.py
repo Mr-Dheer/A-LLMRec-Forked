@@ -1,8 +1,5 @@
 import torch
 import torch.nn as nn
-import json
-import time
-import uuid
 
 from transformers import (
     AutoProcessor,
@@ -211,22 +208,6 @@ class llm4rec(nn.Module):
                 inputs_embeds[inx][idx]=item_emb
         return llm_tokens, inputs_embeds
 
-    def _debug_log(self, hypothesis_id, location, message, data, run_id="pre-fix"):
-        payload = {
-            "id": f"log_{int(time.time() * 1000)}_{uuid.uuid4().hex[:8]}",
-            "timestamp": int(time.time() * 1000),
-            "runId": run_id,
-            "hypothesisId": hypothesis_id,
-            "location": location,
-            "message": message,
-            "data": data,
-        }
-        try:
-            with open("/users/kavach_d/projects/idea-3/.cursor/debug.log", "a", encoding="utf-8") as f:
-                f.write(json.dumps(payload, ensure_ascii=True) + "\n")
-        except Exception:
-            pass
-    
     def forward(self, log_emb, samples):
         """
         Compute the Stage-2 language modeling loss.
@@ -259,66 +240,20 @@ class llm4rec(nn.Module):
         # pixel_values are returned for the vision encoder.
         if samples.get('images') is not None:
             image_groups = samples['images']
-            image_group_lengths = [len(g) if isinstance(g, list) else -1 for g in image_groups]
-            image_token_counts = [t.count("<image>") for t in samples['text_input']]
-            has_any_nonempty_image_group = any(v > 0 for v in image_group_lengths)
-            # region agent log
-            self._debug_log(
-                "H1_H2_H5",
-                "models/llm4rec.py:247",
-                "processor_inputs_summary",
-                {
-                    "batch_size_text": int(len(samples['text_input'])),
-                    "batch_size_images": int(len(image_groups)),
-                    "image_group_lengths_first10": image_group_lengths[:10],
-                    "empty_image_group_count": int(sum(1 for v in image_group_lengths if v == 0)),
-                    "image_token_counts_first10": image_token_counts[:10],
-                    "has_any_nonempty_image_group": bool(has_any_nonempty_image_group),
-                },
-                run_id="post-fix",
+            has_any_nonempty_image_group = any(
+                len(g) > 0 for g in image_groups if isinstance(g, list)
             )
-            # endregion
             if has_any_nonempty_image_group:
-                try:
-                    processed = self.processor(
-                        text=samples['text_input'],
-                        images=image_groups,
-                        return_tensors="pt",
-                        padding="longest",
-                    ).to(self.device)
-                except Exception as e:
-                    # region agent log
-                    self._debug_log(
-                        "H3",
-                        "models/llm4rec.py:267",
-                        "processor_call_exception",
-                        {
-                            "error_type": type(e).__name__,
-                            "error": str(e),
-                            "batch_size_text": int(len(samples['text_input'])),
-                            "batch_size_images": int(len(image_groups)),
-                        },
-                        run_id="post-fix",
-                    )
-                    # endregion
-                    raise
+                processed = self.processor(
+                    text=samples['text_input'],
+                    images=image_groups,
+                    return_tensors="pt",
+                    padding="longest",
+                ).to(self.device)
                 text_input_tokens = processed
                 pixel_values = processed.pixel_values
                 image_attention_mask = processed.get('image_attention_mask')
             else:
-                # region agent log
-                self._debug_log(
-                    "H1",
-                    "models/llm4rec.py:281",
-                    "fallback_to_text_only_tokenizer_due_to_empty_image_groups",
-                    {
-                        "batch_size_text": int(len(samples['text_input'])),
-                        "image_group_lengths_first10": image_group_lengths[:10],
-                        "image_token_counts_first10": image_token_counts[:10],
-                    },
-                    run_id="post-fix",
-                )
-                # endregion
                 text_input_tokens = self.llm_tokenizer(
                     samples['text_input'],
                     return_tensors="pt",
@@ -384,7 +319,15 @@ class llm4rec(nn.Module):
         else:
             input_ids_for_model = llm_tokens['input_ids']
 
-        with torch.cuda.amp.autocast():
+        # Cast inputs_embeds to the model's dtype so it matches the vision
+        # encoder output dtype (bfloat16).  Without this, the float32 projection
+        # heads upcast inputs_embeds and SmolVLM's inputs_merger crashes when it
+        # tries to scatter float16 image features into a float32 tensor.
+        if pixel_values is not None:
+            model_dtype = next(self.llm_model.parameters()).dtype
+            inputs_embeds = inputs_embeds.to(model_dtype)
+
+        with torch.amp.autocast('cuda', dtype=torch.bfloat16):
             outputs = self.llm_model(
                 input_ids=input_ids_for_model,
                 inputs_embeds=inputs_embeds,
