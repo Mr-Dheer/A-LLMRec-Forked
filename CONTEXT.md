@@ -112,7 +112,7 @@ All experiments used the `All_Beauty` Amazon dataset.
 
 | # | Model | Architecture | Hit@1 | Notes |
 |---|-------|-------------|-------|-------|
-| 1 | SmolVLM-2B-Instruct | Original A-LLMRec, LLM swapped from OPT to SmolVLM-2B, with chat template wrapping | **45%** | First successful SmolVLM integration |
+| 1 | SmolVLM2-2.2B-Instruct | Original A-LLMRec, LLM swapped from OPT to SmolVLM2-2.2B, with chat template wrapping | **45%** | First successful SmolVLM integration |
 | 2 | SmolVLM-500M-Instruct | Same swap, no chat template | 14% | Too small; also missing chat template |
 | 3 | OPT-6.7B | Original A-LLMRec, no changes | 44% | Baseline to beat |
 | 4 | OPT-6.7B + ID prediction | Modified to predict item ID instead of text title (branch `id-pred-1`) | **51%** | Best result so far |
@@ -124,7 +124,7 @@ All experiments used the `All_Beauty` Amazon dataset.
 ## 4. What Was Just Implemented: Image Integration into Stage 2
 
 ### Motivation
-AlmostRec demonstrated that feeding product images as an additional modality meaningfully improves recommendation quality. SmolVLM-2B-Instruct is an LMM (Large Multimodal Model, architecture: `Idefics3ForConditionalGeneration`) that natively supports image inputs via a SigLIP vision encoder. The hypothesis is that showing product images from the user's purchase/watch history gives the model visual context about the user's preferences that text alone cannot capture.
+AlmostRec demonstrated that feeding product images as an additional modality meaningfully improves recommendation quality. SmolVLM2-2.2B-Instruct (`HuggingFaceTB/SmolVLM2-2.2B-Instruct`) is an LMM (Large Multimodal Model, architecture: `Idefics3ForConditionalGeneration`) that natively supports image inputs via a SigLIP vision encoder. The hypothesis is that showing product images from the user's purchase/watch history gives the model visual context about the user's preferences that text alone cannot capture.
 
 ### Design Decision
 We feed the **5 most recent** history items as images. Specifically:
@@ -136,9 +136,9 @@ We feed the **5 most recent** history items as images. Specifically:
 This design keeps the existing CF embedding injection mechanism intact while adding visual information for the most contextually relevant (recent) items.
 
 ### How SmolVLM Processes Images (Technical Detail)
-SmolVLM uses the `Idefics3Processor` which expands each `<image>` text placeholder into a sequence of ~81 image patch tokens in `input_ids` (with surrounding `<fake_token_around_image>` delimiters). With image splitting enabled (`do_image_splitting: true`, `scale_factor: 3`), a single product image can produce up to ~1000 tokens total. With 5 images that is ~5000 extra tokens, well within the 16k context window.
+SmolVLM2 uses the `Idefics3Processor` which expands each `<image>` text placeholder into a variable number of image patch tokens in `input_ids` (with surrounding `<fake_token_around_image>` delimiters). Image splitting is disabled (`do_image_splitting=False`) to keep sequence lengths manageable. With 5 images the total extra tokens are well within the 16k context window.
 
-The model's own `forward()` method handles the vision injection:
+The model is loaded with `flash_attention_2` for faster inference. The model's own `forward()` method handles the vision injection:
 1. Text+images are tokenized by `Idefics3Processor` → expanded `input_ids` + `pixel_values`
 2. `inputs_embeds` is computed from `input_ids` via the embedding layer
 3. **Our code** replaces `[HistoryEmb]`/`[CandidateEmb]` positions in `inputs_embeds` with projected CF embeddings (unchanged from before)
@@ -157,11 +157,12 @@ Added saving of an `id_to_asin` mapping (`{int_id: asin_string}`) alongside the 
 
 #### `models/a_llmrec_model.py`
 - **Imports**: Added `os` and `PIL.Image` at module level.
-- **`__init__`**: Loads `{dataset}_id_to_asin.json.gz` into `self.id_to_asin`; sets `self.image_dir = ./data/images/{dataset}`.
-- **`load_history_images(item_ids, n=5)`**: New method. Maps the last `n` item IDs to ASINs, opens their JPEG files, falls back to a black image on any error, and always returns a list of exactly `n` PIL Images.
-- **`make_interact_text(interact_ids, interact_max_num, use_images=False)`**: Added `use_images` parameter. When `True`, the last 5 items in the history slice get `[HistoryEmb]<image>` instead of just `[HistoryEmb]`.
-- **`pre_train_phase2()`**: Sets `use_images = (self.args.llm == 'smolvlm')`, collects `images_batch` (one list of 5 PIL Images per sample in the batch), includes it in the `samples` dict passed to `self.llm.forward()`.
-- **`generate()`**: Same `use_images` flag. Selects between full processor and plain tokenizer for prompt tokenization. Passes `pixel_values`, `image_attention_mask`, and `input_ids` to `llm_model.generate()`.
+- **`__init__`**: Loads `{dataset}_id_to_asin.json.gz` into `self.id_to_asin`; sets `self.image_dir = ./data/images/{dataset}`; calls `_preload_images()` to warm an in-memory cache.
+- **`_preload_images()`**: New method. At init time, iterates all ASINs in `id_to_asin` and loads every JPEG into `self._image_cache = {int_id: PIL.Image}`. Skips failures silently. This avoids repeated disk I/O during training/inference.
+- **`load_history_images(item_ids, n=5)`**: Looks up the last `n` item IDs in `self._image_cache`. Falls back to a 100×100 black image for cache misses, and pads with black images at the front if history has fewer than `n` items. Always returns exactly `n` PIL Images.
+- **`make_interact_text(interact_ids, interact_max_num, use_images=False)`**: Added `use_images` parameter. When `True`, the last 5 items in the history slice get `[HistoryEmb]<image>` instead of just `[HistoryEmb]`. The number of `<image>` tokens inserted here must exactly match the number of images passed to the processor — a mismatch causes a runtime crash.
+- **`pre_train_phase2()`**: Sets `use_images = (self.args.llm == 'smolvlm')`, collects `images_batch` (one list of PIL Images per sample), calculates `n_images = min(5, len(interact_ids[-10:]))` to handle short histories. Includes images in the `samples` dict passed to `self.llm.forward()`.
+- **`generate()`**: Same `use_images` flag and `n_images` calculation. Selects between full processor and plain tokenizer for prompt tokenization. Passes `pixel_values`, `image_attention_mask`, and `input_ids` to `llm_model.generate()`.
 
 ---
 
@@ -212,7 +213,32 @@ Step 6 — LMM forward pass:
 
 ---
 
-## 6. What Remains To Do (Planned Next Steps)
+## 6. Non-Obvious Implementation Details (Why Things Are Done This Way)
+
+### dtype alignment for inputs_embeds
+The projection heads (`log_emb_proj`, `item_emb_proj`) run in float32. SmolVLM's vision encoder runs in bfloat16. When Idefics3's `inputs_merger` scatters vision features into `inputs_embeds`, the two tensors must share the same dtype or PyTorch raises a type mismatch error. Fix: before passing `inputs_embeds` to the model, cast it to `next(self.llm_model.parameters()).dtype` (bfloat16) when `pixel_values` is not None.
+
+### Dummy pad token for input_ids alignment
+When we prepend the user representation vector to `inputs_embeds` (via `torch.cat`), `inputs_embeds` becomes one token longer than `llm_tokens.input_ids`. But Idefics3 uses `input_ids` to locate `<image>` token positions. If lengths don't match, the index lookup is off-by-one. Fix: prepend a single pad token ID to `input_ids` before passing to the model. The pad ID is not the image-token ID, so Idefics3 ignores position 0 (the user-rep slot).
+
+### LoRA applied AFTER freezing
+All base LLM parameters are frozen in a loop first (`param.requires_grad = False`). LoRA is then applied with `get_peft_model()`. This order matters: if you call `get_peft_model` first, the freeze loop will also freeze the LoRA adapter weights (A, B matrices) which are the only things that should be trainable. LoRA targets `q_proj`, `k_proj`, `v_proj`, `o_proj` with `r=16`, `lora_alpha=32`, `dropout=0.05`. LoRA weights are saved/loaded separately from the projection heads.
+
+### OPT token ID 0 remapping at decode time
+OPT uses token ID 0 as the padding token. `batch_decode(..., skip_special_tokens=True)` doesn't strip it by default since it's not registered as a special token. Fix (OPT only): `outputs[outputs == 0] = 2` remaps all 0s to the EOS token (2) before decoding. This line is intentionally skipped for SmolVLM where token ID 0 is `<|endoftext|>`, a real content token.
+
+### Chat template for SmolVLM-Instruct
+SmolVLM2-2.2B-Instruct was trained with the Idefics3 chat format. Without the `<|im_start|>User: ... <end_of_utterance>\nAssistant:` wrapper, the model generates verbose off-topic text rather than a product title. OPT (not instruction-tuned) receives the raw prompt unchanged.
+
+### Image count must equal `<image>` token count
+`make_interact_text` emits exactly `n_images = min(5, len(interact_ids[-10:]))` `<image>` tokens. The same `n_images` is passed to `load_history_images`. If these two counts differ, the Idefics3Processor will fail to match images to tokens. This coupling is fragile — any future change to how many `<image>` tokens are inserted must be reflected in the image loading call.
+
+### Wandb integration (optional)
+`train_model.py` supports optional Weights & Biases logging via `--use_wandb`, `--wandb_project`, `--wandb_run_name`, and `--wandb_log_interval` args. Only rank 0 logs in multi-GPU mode. Phase 1 logs all four loss components; Phase 2 logs the combined LM loss.
+
+---
+
+## 7. What Remains To Do (Planned Next Steps)
 
 1. **Integrate ID prediction** (from branch `id-pred-1`) into the SmolVLM+images pipeline. This replaces text generation with a softmax over all candidate item IDs using a linear transformation layer, preventing hallucinations and giving a 51% baseline. This is the main technique from AlmostRec.
 
@@ -224,7 +250,7 @@ Step 6 — LMM forward pass:
 
 ---
 
-## 7. Running the Code
+## 8. Running the Code
 
 ```bash
 # Pre-train SASRec backbone (generates id_to_asin mapping too)
