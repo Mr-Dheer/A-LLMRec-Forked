@@ -15,10 +15,7 @@ from torch.distributed import init_process_group, destroy_process_group
 from models.a_llmrec_model import *
 from pre_train.sasrec.utils import data_partition, SeqDataset, SeqDataset_Inference
 
-try:
-    import wandb
-except ImportError:
-    wandb = None
+wandb = None
 
 
 def setup_ddp(rank, world_size):
