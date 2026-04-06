@@ -8,7 +8,7 @@ def get_answers_predictions(file_path):
     with open(file_path, 'r') as f:
         for line in f:
             if 'Answer:' == line[:len('Answer:')]:
-                answer = line.replace('Answer:', '').strip()[1:-1].lower()
+                answer = line.replace('Answer:', '').strip()[1:-1].strip().lower()
                 answers.append(answer)
             if 'LLM:' == line[:len('LLM:')]:
                 # SmolVLM format: "LLM: title text"  (trailing " only, no leading ")

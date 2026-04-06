@@ -24,7 +24,7 @@ if __name__ == "__main__":
     )
     
     # dataset setting
-    parser.add_argument("--rec_pre_trained_data", type=str, default='Movies_and_TV')
+    parser.add_argument("--rec_pre_trained_data", type=str, default='Luxury_Beauty')
     
     # train phase setting
     parser.add_argument("--pretrain_stage1", action='store_true')
@@ -39,12 +39,13 @@ if __name__ == "__main__":
     
     # hyperparameters options
     parser.add_argument('--batch_size1', default=32, type=int)
-    parser.add_argument('--batch_size2', default=2, type=int)
+    parser.add_argument('--batch_size2', default=4, type=int)
     parser.add_argument('--batch_size_infer', default=32, type=int)
     parser.add_argument('--maxlen', default=50, type=int)
     parser.add_argument('--num_epochs', default=10, type=int)
     parser.add_argument("--stage1_lr", type=float, default=0.0001)
     parser.add_argument("--stage2_lr", type=float, default=0.0001)
+    parser.add_argument("--resume_epoch", type=int, default=0, help="Resume stage-2 training from this epoch checkpoint (0 = start fresh).")
     parser.add_argument("--use_wandb", action="store_true", help="Enable Weights & Biases logging.")
     parser.add_argument("--wandb_project", type=str, default="a-llmrec", help="W&B project name.")
     parser.add_argument("--wandb_run_name", type=str, default=None, help="Optional W&B run name.")

@@ -156,6 +156,10 @@ def train_model_phase2_(rank,world_size,args):
     phase1_epoch = 10
     model.load_model(args, phase1_epoch=phase1_epoch)
 
+    resume_epoch = getattr(args, 'resume_epoch', 0)
+    if resume_epoch > 0:
+        model.load_stage2_checkpoint(args, phase1_epoch, resume_epoch)
+
     dataset = data_partition(args.rec_pre_trained_data, path=f'./data/amazon/{args.rec_pre_trained_data}.txt')
     [user_train, user_valid, user_test, usernum, itemnum] = dataset
     print('user num:', usernum, 'item num:', itemnum)
@@ -173,8 +177,8 @@ def train_model_phase2_(rank,world_size,args):
         train_data_loader = DataLoader(train_data_set, batch_size = args.batch_size2, pin_memory=True, shuffle=True)
     adam_optimizer = torch.optim.Adam(model.parameters(), lr=args.stage2_lr, betas=(0.9, 0.98))
     wandb_run = _setup_wandb(args, rank, phase="phase2")
-    
-    epoch_start_idx = 1
+
+    epoch_start_idx = resume_epoch + 1
     T = 0.0
     model.train()
     t0 = time.time()

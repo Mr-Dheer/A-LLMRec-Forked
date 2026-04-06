@@ -106,20 +106,7 @@ For a dataset named `All_Beauty`, preprocessing generates:
 
 ---
 
-## 3. Experiments Run Prior to Current Work
 
-All experiments used the `All_Beauty` Amazon dataset.
-
-| # | Model | Architecture | Hit@1 | Notes |
-|---|-------|-------------|-------|-------|
-| 1 | SmolVLM2-2.2B-Instruct | Original A-LLMRec, LLM swapped from OPT to SmolVLM2-2.2B, with chat template wrapping | **45%** | First successful SmolVLM integration |
-| 2 | SmolVLM-500M-Instruct | Same swap, no chat template | 14% | Too small; also missing chat template |
-| 3 | OPT-6.7B | Original A-LLMRec, no changes | 44% | Baseline to beat |
-| 4 | OPT-6.7B + ID prediction | Modified to predict item ID instead of text title (branch `id-pred-1`) | **51%** | Best result so far |
-
-**Key finding:** SmolVLM-2B matches OPT-6.7B at 45% hit rate, and ID prediction (instead of text generation) gives a significant boost to 51%. The goal is to now combine SmolVLM's vision capability with the ID prediction approach, but we are implementing them incrementally — images first (text generation still), then integrate ID prediction later.
-
----
 
 ## 4. What Was Just Implemented: Image Integration into Stage 2
 

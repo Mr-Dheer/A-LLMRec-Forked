@@ -114,7 +114,10 @@ class llm4rec(nn.Module):
             lora_config = LoraConfig(
                 r=16,
                 lora_alpha=32,
-                target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
+                # q_proj/k_proj/v_proj match both text decoder and vision encoder.
+                # o_proj  = text decoder output projection.
+                # out_proj = vision encoder output projection (SigLIP naming).
+                target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "out_proj"],
                 lora_dropout=0.05,
                 bias="none",
             )

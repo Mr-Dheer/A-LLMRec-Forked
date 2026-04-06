@@ -159,6 +159,15 @@ class A_llmrec_model(nn.Module):
                 lora_state = torch.load(out_dir + 'lora.pt', map_location=args.device)
                 self.llm.llm_model.load_state_dict(lora_state, strict=False)
 
+    def load_stage2_checkpoint(self, args, phase1_epoch, phase2_epoch):
+        out_dir = f'./models/saved_models/{args.rec_pre_trained_data}_{args.recsys}_{phase1_epoch}_{args.llm}_{phase2_epoch}_'
+        self.log_emb_proj.load_state_dict(torch.load(out_dir + 'log_proj.pt', map_location=args.device))
+        self.item_emb_proj.load_state_dict(torch.load(out_dir + 'item_proj.pt', map_location=args.device))
+        if args.llm == 'smolvlm':
+            lora_state = torch.load(out_dir + 'lora.pt', map_location=args.device)
+            self.llm.llm_model.load_state_dict(lora_state, strict=False)
+        print(f'Loaded stage-2 checkpoint from epoch {phase2_epoch}')
+
     def find_item_text(self, item, title_flag=True, description_flag=True):
         """
         Lookup titles/descriptions for a list of item IDs and format as strings.
@@ -203,22 +212,19 @@ class A_llmrec_model(nn.Module):
         print(f'Pre-loaded {len(cache)} / {len(self.id_to_asin)} product images into memory')
         return cache
 
-    def load_history_images(self, item_ids, n=10):
+    def load_history_images(self, item_ids, n=5):
         """
-        Load the last n product images for the given item_ids sequence.
+        Load product images for the last n items that have real images.
 
-        Looks up images from the in-memory cache (populated at init).
-        Falls back to a 100x100 black image for missing items.
-        The returned list always contains exactly n PIL Images (padded at the
-        front with black images if the history is shorter than n).
+        Only returns images that exist in the cache — no black fallback.
+        Items without images are skipped entirely.  The caller must ensure
+        the number of <image> tokens in the prompt matches len(returned list).
         """
-        black = Image.fromarray(np.zeros((100, 100, 3), dtype=np.uint8))
         images = []
         for item_id in list(item_ids)[-n:]:
-            img = self._image_cache.get(int(item_id), black)
-            images.append(img)
-        while len(images) < n:
-            images.insert(0, black)
+            img = self._image_cache.get(int(item_id))
+            if img is not None:
+                images.append(img)
         return images
 
     def get_item_emb(self, item_ids):
@@ -356,10 +362,11 @@ class A_llmrec_model(nn.Module):
         Appends a special marker [HistoryEmb] to each title so we can
         later replace it with the aligned item embedding in the LLM input.
 
-        When use_images=True (SmolVLM path), all items in the slice also get
-        an <image> token appended directly after [HistoryEmb].  The
-        Idefics3Processor will expand each <image> into the correct sequence
-        of visual-patch tokens when the prompt is tokenized.
+        When use_images=True (SmolVLM path), the last 5 items that have a
+        real image in the cache get an <image> token after [HistoryEmb].
+        Items without images are skipped — no black fallback.  The number
+        of <image> tokens emitted here must exactly match the number of
+        PIL images passed to the processor.
         """
         interact_item_titles_ = self.find_item_text(interact_ids, title_flag=True, description_flag=False)
         interact_text = []
@@ -368,12 +375,16 @@ class A_llmrec_model(nn.Module):
                 interact_text.append(title + '[HistoryEmb]')
         else:
             titles_slice = interact_item_titles_[-interact_max_num:]
+            ids_slice = interact_ids[-interact_max_num:]
+            # Only add <image> for the last 5 items that have real images.
             for j, title in enumerate(titles_slice):
                 suffix = '[HistoryEmb]'
-                if use_images and j >= len(titles_slice) - 10:
-                    suffix += '<image>'
+                if use_images and j >= len(titles_slice) - 5:
+                    item_id = int(ids_slice[j])
+                    if item_id in self._image_cache:
+                        suffix += '<image>'
                 interact_text.append(title + suffix)
-            interact_ids = interact_ids[-interact_max_num:]
+            interact_ids = ids_slice
 
         interact_text = ','.join(interact_text)
         return interact_text, interact_ids
@@ -477,11 +488,10 @@ class A_llmrec_model(nn.Module):
             interact_embs.append(self.item_emb_proj(self.get_item_emb(interact_ids)))
             candidate_embs.append(self.item_emb_proj(self.get_item_emb(candidate_ids)))
 
-            # Collect images for all min(10, history_len) history items (SmolVLM only).
+            # Collect only real images for the last 5 history items (SmolVLM only).
             # Must match the number of <image> tokens emitted by make_interact_text.
             if use_images:
-                n_images = min(10, len(interact_ids[-10:]))
-                sample_images = self.load_history_images(interact_ids, n=n_images)
+                sample_images = self.load_history_images(interact_ids, n=5)
                 images_batch.append(sample_images)
 
         samples = {
@@ -558,11 +568,11 @@ class A_llmrec_model(nn.Module):
                 interact_embs.append(self.item_emb_proj(self.get_item_emb(interact_ids)))
                 candidate_embs.append(self.item_emb_proj(self.get_item_emb(candidate_ids)))
 
-                # Collect images for all min(10, history_len) history items (SmolVLM only).
+                # Collect only real images for the last 5 history items (SmolVLM only).
                 # Must match the number of <image> tokens emitted by make_interact_text.
                 if use_images:
-                    n_images = min(10, len(interact_ids[-10:]))
-                    images_batch.append(self.load_history_images(interact_ids, n=n_images))
+                    sample_images = self.load_history_images(interact_ids, n=5)
+                    images_batch.append(sample_images)
 
         # Add user representation token at the beginning of the LLM input.
         log_emb = self.log_emb_proj(log_emb)
