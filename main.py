@@ -13,7 +13,17 @@ if __name__ == "__main__":
     # GPU train options
     parser.add_argument("--multi_gpu", action='store_true')
     parser.add_argument('--gpu_num', type=int, default=0)
-    
+
+    # ablation flags — decouple LoRA and images from --llm choice
+    parser.add_argument("--use_lora", action="store_true",
+                        help="Enable LoRA adapters on SmolVLM (off = fully frozen LLM).")
+    parser.add_argument("--use_images", action="store_true",
+                        help="Enable image injection in prompt (off = text-only prompt).")
+    parser.add_argument("--visual_dropout", type=float, default=0.0,
+                        help="Probability of masking a history item title during Stage 2 training.")
+    parser.add_argument("--stage1_experiment", type=str, default=None,
+                        help="Experiment name to load Stage 1 checkpoints from. Defaults to --experiment.")
+
     # model setting
     parser.add_argument("--llm", type=str, default='opt', help='flan_t5, opt, vicuna, smolvlm')
     parser.add_argument("--recsys", type=str, default='sasrec')
@@ -51,7 +61,10 @@ if __name__ == "__main__":
     parser.add_argument("--wandb_log_interval", type=int, default=1, help="Log to W&B every N steps.")
     
     args = parser.parse_args()
-    
+
+    if args.stage1_experiment is None:
+        args.stage1_experiment = args.experiment
+
     args.device = 'cuda:' + str(args.gpu_num)
     
     if args.pretrain_stage1:
