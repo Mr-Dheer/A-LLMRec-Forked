@@ -24,6 +24,11 @@ if __name__ == "__main__":
     parser.add_argument("--stage1_experiment", type=str, default=None,
                         help="Experiment name to load Stage 1 checkpoints from. Defaults to --experiment.")
 
+    # experiment name — included in checkpoint path so different runs
+    # never overwrite each other's saved models
+    parser.add_argument("--experiment", type=str, default='default',
+                        help='Unique name for this run. Included in the checkpoint directory name.')
+
     # model setting
     parser.add_argument("--llm", type=str, default='opt', help='flan_t5, opt, vicuna, smolvlm')
     parser.add_argument("--recsys", type=str, default='sasrec')

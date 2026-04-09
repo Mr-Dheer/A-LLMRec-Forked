@@ -114,7 +114,7 @@ class A_llmrec_model(nn.Module):
             nn.init.xavier_normal_(self.item_emb_proj[3].weight)
             
     def save_model(self, args, epoch1=None, epoch2=None):
-        out_dir = f'./models/saved_models/'
+        out_dir = f'./models/saved_models/{args.experiment}/'
         create_dir(out_dir)
         out_dir += f'{args.rec_pre_trained_data}_{args.recsys}_{epoch1}_'
         # Save Stage 1 modules (alignment between CF and SBERT).
