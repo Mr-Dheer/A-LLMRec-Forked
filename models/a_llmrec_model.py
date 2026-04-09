@@ -129,35 +129,39 @@ class A_llmrec_model(nn.Module):
         if args.pretrain_stage2:
             torch.save(self.log_emb_proj.state_dict(), out_dir + 'log_proj.pt')
             torch.save(self.item_emb_proj.state_dict(), out_dir + 'item_proj.pt')
-            # Save LoRA adapter weights (SmolVLM only).
-            if args.llm == 'smolvlm':
+            # Save LoRA adapter weights (SmolVLM only, when LoRA is enabled).
+            if args.llm == 'smolvlm' and getattr(args, 'use_lora', False):
                 lora_state = {k: v for k, v in self.llm.llm_model.state_dict().items() if 'lora_' in k}
                 torch.save(lora_state, out_dir + 'lora.pt')
-            
+
     def load_model(self, args, phase1_epoch=None, phase2_epoch=None):
-        out_dir = f'./models/saved_models/{args.rec_pre_trained_data}_{args.recsys}_{phase1_epoch}_'
-        
+        # Stage 1 checkpoints may live in a different experiment directory
+        # (shared across ablation runs).
+        stage1_exp = getattr(args, 'stage1_experiment', args.experiment)
+        stage1_dir = f'./models/saved_models/{stage1_exp}/{args.rec_pre_trained_data}_{args.recsys}_{phase1_epoch}_'
+
         # Load Stage 1 alignment MLP and freeze it for later stages.
-        mlp = torch.load(out_dir + 'mlp.pt', map_location = args.device)
+        mlp = torch.load(stage1_dir + 'mlp.pt', map_location=args.device)
         self.mlp.load_state_dict(mlp)
         del mlp
         for name, param in self.mlp.named_parameters():
             param.requires_grad = False
 
         if args.inference:
-            out_dir += f'{args.llm}_{phase2_epoch}_'
+            # Stage 2 checkpoints use the current experiment directory.
+            stage2_dir = f'./models/saved_models/{args.experiment}/{args.rec_pre_trained_data}_{args.recsys}_{phase1_epoch}_{args.llm}_{phase2_epoch}_'
 
-            log_emb_proj_dict = torch.load(out_dir + 'log_proj.pt', map_location = args.device)
+            log_emb_proj_dict = torch.load(stage2_dir + 'log_proj.pt', map_location=args.device)
             self.log_emb_proj.load_state_dict(log_emb_proj_dict)
             del log_emb_proj_dict
 
-            item_emb_proj_dict = torch.load(out_dir + 'item_proj.pt', map_location = args.device)
+            item_emb_proj_dict = torch.load(stage2_dir + 'item_proj.pt', map_location=args.device)
             self.item_emb_proj.load_state_dict(item_emb_proj_dict)
             del item_emb_proj_dict
 
-            # Load LoRA adapter weights (SmolVLM only).
-            if args.llm == 'smolvlm':
-                lora_state = torch.load(out_dir + 'lora.pt', map_location=args.device)
+            # Load LoRA adapter weights (SmolVLM only, when LoRA is enabled).
+            if args.llm == 'smolvlm' and getattr(args, 'use_lora', False):
+                lora_state = torch.load(stage2_dir + 'lora.pt', map_location=args.device)
                 self.llm.llm_model.load_state_dict(lora_state, strict=False)
 
     def find_item_text(self, item, title_flag=True, description_flag=True):
