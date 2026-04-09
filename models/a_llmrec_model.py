@@ -431,7 +431,7 @@ class A_llmrec_model(nn.Module):
         images_batch = []
         self.llm.train()
 
-        use_images = (self.args.llm == 'smolvlm')
+        use_images = getattr(self.args, 'use_images', False)
 
         # Get CF user representations for the batch (frozen CF-RecSys).
         with torch.no_grad():
@@ -514,7 +514,7 @@ class A_llmrec_model(nn.Module):
         """
         u, seq, pos, neg, rank = data
 
-        use_images = (self.args.llm == 'smolvlm')
+        use_images = getattr(self.args, 'use_images', False)
 
         answer = []
         text_input = []
