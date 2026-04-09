@@ -361,6 +361,11 @@ class A_llmrec_model(nn.Module):
         also get an <image> token appended directly after [HistoryEmb].  The
         Idefics3Processor will expand each <image> into the correct sequence
         of visual-patch tokens when the prompt is tokenized.
+
+        When visual_dropout > 0 and the model is in training mode, each
+        image-eligible item's title is replaced with "[MASKED]" with
+        probability p.  The [HistoryEmb] CF embedding and <image> token
+        remain, forcing the LLM to extract signal from visual tokens.
         """
         interact_item_titles_ = self.find_item_text(interact_ids, title_flag=True, description_flag=False)
         interact_text = []
@@ -369,10 +374,14 @@ class A_llmrec_model(nn.Module):
                 interact_text.append(title + '[HistoryEmb]')
         else:
             titles_slice = interact_item_titles_[-interact_max_num:]
+            dropout_p = getattr(self.args, 'visual_dropout', 0.0)
             for j, title in enumerate(titles_slice):
                 suffix = '[HistoryEmb]'
                 if use_images and j >= len(titles_slice) - 5:
                     suffix += '<image>'
+                    # Training-time modality dropout: mask title, keep CF embedding + image
+                    if self.training and dropout_p > 0 and random.random() < dropout_p:
+                        title = '"[MASKED]"'
                 interact_text.append(title + suffix)
             interact_ids = interact_ids[-interact_max_num:]
 
