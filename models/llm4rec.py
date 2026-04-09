@@ -31,6 +31,7 @@ class llm4rec(nn.Module):
         llm_model="",
         max_output_txt_len=256,
         load_in_4bit=False,
+        use_lora=False,
     ):
         super().__init__()
         self.device = device
@@ -110,7 +111,7 @@ class llm4rec(nn.Module):
         # LoRA adds small trainable adapter matrices (A, B) alongside frozen
         # attention projections. Only these new parameters have requires_grad=True.
         # Must be applied AFTER the freeze loop above so the loop doesn't touch them.
-        if llm_model == "smolvlm":
+        if llm_model == "smolvlm" and use_lora:
             lora_config = LoraConfig(
                 r=16,
                 lora_alpha=32,

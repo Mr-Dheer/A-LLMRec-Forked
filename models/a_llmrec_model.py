@@ -93,6 +93,7 @@ class A_llmrec_model(nn.Module):
                 device=self.device,
                 llm_model=args.llm,
                 load_in_4bit=args.load_in_4bit,
+                use_lora=getattr(args, 'use_lora', False),
             )
             
             self.log_emb_proj = nn.Sequential(
