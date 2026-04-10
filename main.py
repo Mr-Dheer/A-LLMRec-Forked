@@ -21,6 +21,8 @@ if __name__ == "__main__":
                         help="Enable image injection in prompt (off = text-only prompt).")
     parser.add_argument("--visual_dropout", type=float, default=0.0,
                         help="Probability of masking a history item title during Stage 2 training.")
+    parser.add_argument("--num_history_images", type=int, default=5,
+                        help="Number of most-recent history items to attach an <image> token to (default: 5).")
     parser.add_argument("--stage1_experiment", type=str, default=None,
                         help="Experiment name to load Stage 1 checkpoints from. Defaults to --experiment.")
 

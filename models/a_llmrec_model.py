@@ -361,9 +361,9 @@ class A_llmrec_model(nn.Module):
         Appends a special marker [HistoryEmb] to each title so we can
         later replace it with the aligned item embedding in the LLM input.
 
-        When use_images=True (SmolVLM path), the last 5 items in the slice
-        also get an <image> token appended directly after [HistoryEmb].  The
-        Idefics3Processor will expand each <image> into the correct sequence
+        When use_images=True (SmolVLM path), the last `num_history_images` items
+        in the slice also get an <image> token appended directly after [HistoryEmb].
+        The Idefics3Processor will expand each <image> into the correct sequence
         of visual-patch tokens when the prompt is tokenized.
 
         When visual_dropout > 0 and the model is in training mode, each
@@ -379,9 +379,10 @@ class A_llmrec_model(nn.Module):
         else:
             titles_slice = interact_item_titles_[-interact_max_num:]
             dropout_p = getattr(self.args, 'visual_dropout', 0.0)
+            n_img = getattr(self.args, 'num_history_images', 5)
             for j, title in enumerate(titles_slice):
                 suffix = '[HistoryEmb]'
-                if use_images and j >= len(titles_slice) - 5:
+                if use_images and j >= len(titles_slice) - n_img:
                     suffix += '<image>'
                     # Training-time modality dropout: mask title, keep CF embedding + image
                     if self.training and dropout_p > 0 and random.random() < dropout_p:
@@ -494,7 +495,7 @@ class A_llmrec_model(nn.Module):
             # Collect images for the last min(5, history_len) history items (SmolVLM only).
             # Must match the number of <image> tokens emitted by make_interact_text.
             if use_images:
-                n_images = min(5, len(interact_ids[-10:]))
+                n_images = min(getattr(self.args, 'num_history_images', 5), len(interact_ids[-10:]))
                 sample_images = self.load_history_images(interact_ids, n=n_images)
                 images_batch.append(sample_images)
 
@@ -575,7 +576,7 @@ class A_llmrec_model(nn.Module):
                 # Collect images for the last min(5, history_len) history items (SmolVLM only).
                 # Must match the number of <image> tokens emitted by make_interact_text.
                 if use_images:
-                    n_images = min(5, len(interact_ids[-10:]))
+                    n_images = min(getattr(self.args, 'num_history_images', 5), len(interact_ids[-10:]))
                     images_batch.append(self.load_history_images(interact_ids, n=n_images))
 
         # Add user representation token at the beginning of the LLM input.
