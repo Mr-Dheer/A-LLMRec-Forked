@@ -634,10 +634,10 @@ class A_llmrec_model(nn.Module):
                 else:
                     input_ids_for_model = llm_tokens.input_ids
 
-                # Match inputs_embeds dtype to model dtype (see llm4rec.forward).
-                if pixel_values is not None:
-                    model_dtype = next(self.llm.llm_model.parameters()).dtype
-                    inputs_embeds = inputs_embeds.to(model_dtype)
+                # Match inputs_embeds dtype to model dtype (flash-attn requires
+                # query and key to share dtype; projection heads output fp32).
+                model_dtype = next(self.llm.llm_model.parameters()).dtype
+                inputs_embeds = inputs_embeds.to(model_dtype)
 
                 if use_images:
                     # SmolVLM + images path: model.generate() internally calls
