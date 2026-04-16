@@ -5,9 +5,17 @@ import numpy as np
 def get_answers_predictions(file_path):
     answers = []
     llm_predictions = []
+    # Track whether we've already seen the LLM: line for the current block.
+    # The real Answer: always appears before LLM: in each block; any line
+    # starting with "Answer:" after LLM: is part of the model's generated
+    # reasoning and must not be treated as ground truth.
+    seen_llm_in_block = False
     with open(file_path, 'r') as f:
         for line in f:
-            if 'Answer:' == line[:len('Answer:')]:
+            if line.startswith('--------------------------------'):
+                seen_llm_in_block = False
+                continue
+            if 'Answer:' == line[:len('Answer:')] and not seen_llm_in_block:
                 # [1:-1] strips the surrounding " from the title string.
                 # Extra .strip() handles titles whose metadata has leading/trailing
                 # whitespace (e.g. ' bareMinerals Brow Kit ') — without it, the
@@ -15,6 +23,7 @@ def get_answers_predictions(file_path):
                 answer = line.replace('Answer:', '').strip()[1:-1].strip().lower()
                 answers.append(answer)
             if 'LLM:' == line[:len('LLM:')]:
+                seen_llm_in_block = True
                 # SmolVLM format: "LLM: title text"  (trailing " only, no leading ")
                 llm_prediction = line.replace('LLM:', '', 1).strip()
                 if llm_prediction.endswith('"'):
