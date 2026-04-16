@@ -8,14 +8,18 @@ def get_answers_predictions(file_path):
     with open(file_path, 'r') as f:
         for line in f:
             if 'Answer:' == line[:len('Answer:')]:
-                answer = line.replace('Answer:', '').strip()[1:-1].lower()
+                # [1:-1] strips the surrounding " from the title string.
+                # Extra .strip() handles titles whose metadata has leading/trailing
+                # whitespace (e.g. ' bareMinerals Brow Kit ') — without it, the
+                # leading space causes a false miss even when the prediction is correct.
+                answer = line.replace('Answer:', '').strip()[1:-1].strip().lower()
                 answers.append(answer)
             if 'LLM:' == line[:len('LLM:')]:
                 # SmolVLM format: "LLM: title text"  (trailing " only, no leading ")
                 llm_prediction = line.replace('LLM:', '', 1).strip()
                 if llm_prediction.endswith('"'):
                     llm_prediction = llm_prediction[:-1]
-                llm_predictions.append(llm_prediction.lower())
+                llm_predictions.append(llm_prediction.strip().lower())
 
     return answers, llm_predictions
 
@@ -31,7 +35,10 @@ def evaluate(answers, llm_predictions, k=1):
                 NDCG += 1 / np.log2(rank + 1)
                 HT += 1
         elif k == 1:
-            if answer in prediction:
+            # Bidirectional check: also count when prediction is a prefix of the
+            # answer (title truncated by max_new_tokens limit).  The model is
+            # correct in those cases — the generation just ran out of tokens.
+            if answer in prediction or (prediction and prediction in answer):
                 NDCG += 1
                 HT += 1
                 

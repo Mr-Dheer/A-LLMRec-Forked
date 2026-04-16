@@ -14,6 +14,12 @@ if __name__ == "__main__":
     parser.add_argument("--multi_gpu", action='store_true')
     parser.add_argument('--gpu_num', type=int, default=0)
     
+    # experiment name — included in checkpoint path so different branches/runs
+    # never overwrite each other's saved models
+    parser.add_argument("--experiment", type=str, default='default',
+                        help='Unique name for this run (e.g. smol-img, smol-img-3). '
+                             'Included in the checkpoint directory name.')
+
     # model setting
     parser.add_argument("--llm", type=str, default='opt', help='flan_t5, opt, vicuna, smolvlm')
     parser.add_argument("--recsys", type=str, default='sasrec')
