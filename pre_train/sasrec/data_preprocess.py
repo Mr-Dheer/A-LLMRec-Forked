@@ -96,14 +96,23 @@ def preprocess(fname):
                 review_dict[itemmap[asin]]['summary'][usermap[rev]] = l['summary']
             except:
                 a = 0
+        # Split title and description assignments into independent try blocks.
+        # AMAZON_FASHION's meta has 'title' for ~100% of ASINs but 'description' for only ~8%.
+        # When the two were combined, a missing 'description' key raised KeyError and
+        # skipped the title line below it — causing 87.8% of item IDs to fall back to
+        # "No Title" at inference. Separating them preserves titles even when description
+        # is absent or malformed.
         try:
             if len(meta_dict[asin]['description']) ==0:
                 name_dict['description'][itemmap[asin]] = 'Empty description'
             else:
                 name_dict['description'][itemmap[asin]] = meta_dict[asin]['description'][0]
+        except:
+            pass
+        try:
             name_dict['title'][itemmap[asin]] = meta_dict[asin]['title']
         except:
-            a =0
+            pass
     
     with open(f'../../data/amazon/{fname}_text_name_dict.json.gz', 'wb') as tf:
         pickle.dump(name_dict, tf)
