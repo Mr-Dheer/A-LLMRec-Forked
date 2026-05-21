@@ -164,35 +164,47 @@ class A_llmrec_model(nn.Module):
                 lora_state = torch.load(stage2_dir + 'lora.pt', map_location=args.device)
                 self.llm.llm_model.load_state_dict(lora_state, strict=False)
 
+    # AMAZON_FASHION's title dict contains ~14 items whose "title" field is
+    # 10k-420k chars of scraped Amazon web-page JavaScript.  Clipping at 500
+    # chars is safely above any legitimate title seen across the available
+    # datasets (AF max clean=212, All_Beauty max=436, Luxury_Beauty max=217)
+    # and well below the corruption floor (>10k), so it kills the garbage
+    # without truncating any real title.  Without this clip, one bad item in
+    # a batch's history/candidate set inflates the prompt past SmolVLM2's
+    # 8192 position-embedding limit and OOMs attention (O(n^2) in seq len).
+    _TEXT_FIELD_MAX_CHARS = 500
+
+    def _get_text_field(self, field, item_id, fallback):
+        val = self.text_name_dict[field].get(item_id, fallback)
+        if len(val) > self._TEXT_FIELD_MAX_CHARS:
+            val = val[:self._TEXT_FIELD_MAX_CHARS]
+        return val
+
     def find_item_text(self, item, title_flag=True, description_flag=True):
         """
         Lookup titles/descriptions for a list of item IDs and format as strings.
         """
-        t = 'title'
-        d = 'description'
         t_ = 'No Title'
         d_ = 'No Description'
         if title_flag and description_flag:
-            return [f'"{self.text_name_dict[t].get(i,t_)}, {self.text_name_dict[d].get(i,d_)}"' for i in item]
+            return [f'"{self._get_text_field("title", i, t_)}, {self._get_text_field("description", i, d_)}"' for i in item]
         elif title_flag and not description_flag:
-            return [f'"{self.text_name_dict[t].get(i,t_)}"' for i in item]
+            return [f'"{self._get_text_field("title", i, t_)}"' for i in item]
         elif not title_flag and description_flag:
-            return [f'"{self.text_name_dict[d].get(i,d_)}"' for i in item]
-    
+            return [f'"{self._get_text_field("description", i, d_)}"' for i in item]
+
     def find_item_text_single(self, item, title_flag=True, description_flag=True):
         """
         Single-item version of find_item_text.
         """
-        t = 'title'
-        d = 'description'
         t_ = 'No Title'
         d_ = 'No Description'
         if title_flag and description_flag:
-            return f'"{self.text_name_dict[t].get(item,t_)}, {self.text_name_dict[d].get(item,d_)}"'
+            return f'"{self._get_text_field("title", item, t_)}, {self._get_text_field("description", item, d_)}"'
         elif title_flag and not description_flag:
-            return f'"{self.text_name_dict[t].get(item,t_)}"'
+            return f'"{self._get_text_field("title", item, t_)}"'
         elif not title_flag and description_flag:
-            return f'"{self.text_name_dict[d].get(item,d_)}"'
+            return f'"{self._get_text_field("description", item, d_)}"'
         
     def _preload_images(self):
         """Pre-load all product images into memory to avoid repeated disk I/O."""
