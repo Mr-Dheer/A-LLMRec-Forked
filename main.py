@@ -12,7 +12,7 @@ if __name__ == "__main__":
     
     # GPU train options
     parser.add_argument("--multi_gpu", action='store_true')
-    parser.add_argument('--gpu_num', type=int, default=0)
+    parser.add_argument('--gpu_num', type=int, default=1)
     
     # model setting
     parser.add_argument("--llm", type=str, default='opt', help='flan_t5, opt, vicuna')
@@ -27,7 +27,7 @@ if __name__ == "__main__":
     parser.add_argument("--inference", action='store_true')
     
     # hyperparameters options
-    parser.add_argument('--batch_size1', default=32, type=int)
+    parser.add_argument('--batch_size1', default=512, type=int)
     parser.add_argument('--batch_size2', default=1, type=int)
     parser.add_argument('--batch_size_infer', default=4, type=int)
     parser.add_argument('--maxlen', default=50, type=int)

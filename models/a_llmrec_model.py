@@ -373,16 +373,16 @@ class A_llmrec_model(nn.Module):
                 input_text += 'This user has watched '
             elif self.args.rec_pre_trained_data == 'Video_Games':
                 input_text += 'This user has played '
-            elif self.args.rec_pre_trained_data == 'Luxury_Beauty' or self.args.rec_pre_trained_data == 'Toys_and_Games':
+            elif self.args.rec_pre_trained_data in ('Luxury_Beauty', 'Toys_and_Games', 'AMAZON_FASHION'):
                 input_text += 'This user has bought '
-                
+
             input_text += interact_text
-            
+
             if self.args.rec_pre_trained_data == 'Movies_and_TV':
                 input_text +=' in the previous. Recommend one next movie for this user to watch next from the following movie title set, '
             elif self.args.rec_pre_trained_data == 'Video_Games':
-                input_text +=' in the previous. Recommend one next game for this user to play next from the following game title set, '            
-            elif self.args.rec_pre_trained_data == 'Luxury_Beauty' or self.args.rec_pre_trained_data == 'Toys_and_Games':
+                input_text +=' in the previous. Recommend one next game for this user to play next from the following game title set, '
+            elif self.args.rec_pre_trained_data in ('Luxury_Beauty', 'Toys_and_Games', 'AMAZON_FASHION'):
                 input_text +=' in the previous. Recommend one next item for this user to buy next from the following item title set, '
                     
             input_text += candidate_text
@@ -433,16 +433,16 @@ class A_llmrec_model(nn.Module):
                     input_text += 'This user has watched '
                 elif self.args.rec_pre_trained_data == 'Video_Games':
                     input_text += 'This user has played '
-                elif self.args.rec_pre_trained_data == 'Luxury_Beauty' or self.args.rec_pre_trained_data == 'Toys_and_Games':
+                elif self.args.rec_pre_trained_data in ('Luxury_Beauty', 'Toys_and_Games', 'AMAZON_FASHION'):
                     input_text += 'This user has bought '
-                    
+
                 input_text += interact_text
-                
+
                 if self.args.rec_pre_trained_data == 'Movies_and_TV':
                     input_text +=' in the previous. Recommend one next movie for this user to watch next from the following movie title set, '
                 elif self.args.rec_pre_trained_data == 'Video_Games':
-                    input_text +=' in the previous. Recommend one next game for this user to play next from the following game title set, '            
-                elif self.args.rec_pre_trained_data == 'Luxury_Beauty' or self.args.rec_pre_trained_data == 'Toys_and_Games':
+                    input_text +=' in the previous. Recommend one next game for this user to play next from the following game title set, '
+                elif self.args.rec_pre_trained_data in ('Luxury_Beauty', 'Toys_and_Games', 'AMAZON_FASHION'):
                     input_text +=' in the previous. Recommend one next item for this user to buy next from the following item title set, '
                 
                 input_text += candidate_text

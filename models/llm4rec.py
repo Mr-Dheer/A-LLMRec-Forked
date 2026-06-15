@@ -34,7 +34,7 @@ class llm4rec(nn.Module):
                 quantization_config=bnb_config,
                 dtype=torch.float16,
                 use_safetensors=True,
-                device_map="auto",
+                device_map="cuda:1",
             )
             self.llm_tokenizer = AutoTokenizer.from_pretrained(
                 "facebook/opt-6.7b",
@@ -131,19 +131,25 @@ class llm4rec(nn.Module):
         atts_llm = torch.ones(log_emb.size()[:-1], dtype=torch.long).to(self.device)
         atts_llm = atts_llm.unsqueeze(1)
             
-        # Tokenize the target text (e.g., correct item title) and append EOS.
+        # Cap lengths so the total sequence (input + output + prepended user token)
+        # never exceeds OPT's max_position_embeddings of 2048.
+        max_output_len = self.max_output_txt_len
+        max_input_len = 2048 - max_output_len
+
         text_output_tokens = self.llm_tokenizer(
             [t + self.llm_tokenizer.eos_token for t in samples['text_output']],
             return_tensors="pt",
             padding="longest",
-            truncation=False,
+            truncation=True,
+            max_length=max_output_len,
         ).to(self.device)
-        
+
         text_input_tokens = self.llm_tokenizer(
             samples['text_input'],
             return_tensors="pt",
             padding="longest",
-            truncation=False,
+            truncation=True,
+            max_length=max_input_len,
         ).to(self.device)
         
         # Merge input and output tokens into a single sequence for each example.
